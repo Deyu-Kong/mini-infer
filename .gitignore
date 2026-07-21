@@ -1,0 +1,59 @@
+# Build artifacts
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+CTestTestfile.cmake
+_deps/
+Testing/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# CUDA
+*.cubin
+*.fatbin
+*.fatbinary
+*.ptx
+*.nsight-*
+nsys-*
+
+# Logs
+*.log
+
+# Python (for tests / benchmarks)
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Local model / data caches
+models/
+data/
+*.bin
+*.safetensors
+
+# Profiling
+*.qdrep
+*.qdstrm
