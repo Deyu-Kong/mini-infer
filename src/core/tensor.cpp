@@ -28,8 +28,9 @@ void cuda_check_(cudaError_t err, const char* file, int line) {
     }
 }
 #define MI_CUDA_CHECK(call) cuda_check_(call, __FILE__, __LINE__)
+}  // namespace
 
-// IEEE-754 binary32 -> binary16 conversion on the host (no CUDA header needed).
+// Exposed helper so weight loaders can convert BF16 -> FP16 on CPU.
 uint16_t f32_to_f16_bits(float f) {
     uint32_t x;
     std::memcpy(&x, &f, 4);
@@ -65,7 +66,6 @@ uint16_t f32_to_f16_bits(float f) {
                                  (static_cast<uint32_t>(e) << 10) |
                                  (rounded & 0x3ffu));
 }
-}  // namespace
 
 Tensor::Tensor() = default;
 
@@ -84,6 +84,33 @@ Tensor Tensor::empty(std::vector<int64_t> shape, DType dtype, Device device) {
 }
 
 Tensor::Tensor(Tensor&& other) noexcept { *this = std::move(other); }
+
+Tensor::Tensor(const Tensor& other)
+    : shape_(other.shape_),
+      stride_(other.stride_),
+      numel_(other.numel_),
+      nbytes_(other.nbytes_),
+      dtype_(other.dtype_),
+      device_(other.device_),
+      data_(nullptr),
+      owns_data_(false) {
+    // Allocate fresh memory on the same device and copy bytes. The mmap'd
+    // safetensors regions are read-only so we *must* copy if we want to
+    // take ownership of a view; the deep copy also makes the engine robust
+    // against the source being munmap'd underneath us.
+    allocate_();
+    if (nbytes_ > 0 && data_ != nullptr && other.data_ != nullptr) {
+        copy_raw(other.data_, data_, nbytes_, other.device_, device_);
+    }
+}
+
+Tensor& Tensor::operator=(const Tensor& other) {
+    if (this != &other) {
+        Tensor tmp(other);
+        *this = std::move(tmp);
+    }
+    return *this;
+}
 
 Tensor& Tensor::operator=(Tensor&& other) noexcept {
     if (this != &other) {

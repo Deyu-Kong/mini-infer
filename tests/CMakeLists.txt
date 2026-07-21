@@ -8,6 +8,10 @@ add_subdirectory(test_rope)
 add_subdirectory(test_softmax)
 add_subdirectory(test_swiglu)
 add_subdirectory(test_mlp)
+add_subdirectory(test_model_config)
+add_subdirectory(test_graph)
+add_subdirectory(test_safetensors)
+add_subdirectory(test_qwen_model)
 
 # Ensure the python verifier is discoverable from tests.
 set(MINI_INFER_PYTHON "python3" CACHE STRING "Python interpreter used for verification")

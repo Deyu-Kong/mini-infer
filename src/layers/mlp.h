@@ -21,12 +21,23 @@ namespace mini_infer {
  */
 class MLP {
 public:
+    // Default-constructs an "empty" instance; configure with init() before use.
+    MLP() = default;
     MLP(int64_t hidden, int64_t intermediate, int device_index = 0);
     ~MLP();
+
+    // Move-only: copying would duplicate the cuBLAS handle.
+    MLP(const MLP&) = delete;
+    MLP& operator=(const MLP&) = delete;
+    MLP(MLP&& other) noexcept;
+    MLP& operator=(MLP&& other) noexcept;
 
     Tensor forward(const Tensor& x);
 
     void set_weights(const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down);
+
+    // Initialize a default-constructed instance.
+    void init(int64_t hidden, int64_t intermediate, int device_index);
 
     int64_t hidden()       const { return hidden_; }
     int64_t intermediate() const { return intermediate_; }

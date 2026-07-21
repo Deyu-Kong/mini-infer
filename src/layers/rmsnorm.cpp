@@ -14,6 +14,31 @@ RMSNorm::RMSNorm(int64_t dim, float eps, int device_index)
 
 RMSNorm::~RMSNorm() = default;
 
+RMSNorm::RMSNorm(RMSNorm&& other) noexcept {
+    dim_          = other.dim_;
+    eps_          = other.eps_;
+    device_index_ = other.device_index_;
+    weight_       = std::move(other.weight_);
+}
+
+RMSNorm& RMSNorm::operator=(RMSNorm&& other) noexcept {
+    if (this != &other) {
+        dim_          = other.dim_;
+        eps_          = other.eps_;
+        device_index_ = other.device_index_;
+        weight_       = std::move(other.weight_);
+    }
+    return *this;
+}
+
+void RMSNorm::set_dim_device(int64_t dim, int device_index) {
+    if (dim_ == 0 && weight_.numel() == 0) {
+        dim_ = dim;
+        device_index_ = device_index;
+        weight_ = Tensor::empty({dim}, DType::FP16, Device::cuda(device_index));
+    }
+}
+
 void RMSNorm::set_weight(const Tensor& weight) {
     if (weight.dtype() != DType::FP16) {
         throw std::runtime_error("RMSNorm::set_weight expects FP16");

@@ -4,7 +4,7 @@
 
 ## 状态
 
-**Week 2 / Phase 1: 基础算子** — 完成
+**Week 3 / Phase 1: 模型加载 + 计算图** — 完成
 
 详细路线图见 [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md)，周进度见 [`docs/WEEKLY_PROGRESS.md`](docs/WEEKLY_PROGRESS.md)。
 
@@ -46,17 +46,21 @@ cd build && ctest --output-on-failure
 
 > 完整测量见 `build/benchmarks/bench_kernels`。
 
-## 测试覆盖（7/7 pass）
+## 测试覆盖（11/11 pass）
 
-| 测试        | 对比对象                              |
-| ----------- | ------------------------------------- |
-| tensor      | shape / h2d / d2h / add kernel        |
-| allocator   | 256-byte 对齐 / 单调 / 溢出 / reset    |
-| rmsnorm     | torch.rsqrt(x.pow(2).mean(...) + eps)*w |
-| rope        | 数学公式（split last-dim + rotate）     |
-| softmax     | torch.softmax(dim=-1)                  |
-| swiglu      | silu(gate) * up                        |
-| mlp         | 完整 SwiGLU MLP via cuBLAS GEMM       |
+| 测试             | 对比对象                              |
+| ---------------- | ------------------------------------- |
+| tensor           | shape / h2d / d2h / add kernel        |
+| allocator        | 256-byte 对齐 / 单调 / 溢出 / reset    |
+| rmsnorm          | torch.rsqrt(x.pow(2).mean(...) + eps)*w |
+| rope             | 数学公式（split last-dim + rotate）     |
+| softmax          | torch.softmax(dim=-1)                  |
+| swiglu           | silu(gate) * up                        |
+| mlp              | 完整 SwiGLU MLP via cuBLAS GEMM       |
+| model_config     | 4 个用例：valid / 缺字段 / GQA / 缺必填 |
+| graph            | 空图 / 单节点 / Qwen 单 block / 打印    |
+| safetensors      | 339 张量索引 / shape 校验 / BF16 round-trip |
+| qwen_model       | 加载 14GB Qwen2.5-7B-Instruct，FP16 上 GPU |
 
 ## 路线图（8 周）
 
@@ -64,7 +68,7 @@ cd build && ctest --output-on-failure
 | ---- | ------------------------------------------ | ---- |
 | 1    | 基础设施 / Tensor / Allocator              | ✓    |
 | 2    | RMSNorm / RoPE / Softmax / SwiGLU / MLP GEMM | ✓    |
-| 3    | safetensors loader + 计算图                |      |
+| 3    | safetensors loader + QwenModel + 计算图     | ✓    |
 | 4    | 端到端 Qwen2.5 推理                        |      |
 | 5    | PagedAttention                             |      |
 | 6    | 连续批处理 + Benchmark                     |      |

@@ -108,6 +108,58 @@ MLP::~MLP() {
     }
 }
 
+MLP::MLP(MLP&& other) noexcept {
+    hidden_       = other.hidden_;
+    intermediate_ = other.intermediate_;
+    device_index_ = other.device_index_;
+    w_gate_       = std::move(other.w_gate_);
+    w_up_         = std::move(other.w_up_);
+    w_down_       = std::move(other.w_down_);
+    gate_buf_     = std::move(other.gate_buf_);
+    up_buf_       = std::move(other.up_buf_);
+    silu_buf_     = std::move(other.silu_buf_);
+    cublas_handle_ = other.cublas_handle_;
+    other.cublas_handle_ = nullptr;
+}
+
+MLP& MLP::operator=(MLP&& other) noexcept {
+    if (this != &other) {
+        if (cublas_handle_) cublasDestroy(get_cublas(cublas_handle_));
+        hidden_       = other.hidden_;
+        intermediate_ = other.intermediate_;
+        device_index_ = other.device_index_;
+        w_gate_       = std::move(other.w_gate_);
+        w_up_         = std::move(other.w_up_);
+        w_down_       = std::move(other.w_down_);
+        gate_buf_     = std::move(other.gate_buf_);
+        up_buf_       = std::move(other.up_buf_);
+        silu_buf_     = std::move(other.silu_buf_);
+        cublas_handle_ = other.cublas_handle_;
+        other.cublas_handle_ = nullptr;
+    }
+    return *this;
+}
+
+void MLP::init(int64_t hidden, int64_t intermediate, int device_index) {
+    if (hidden_ != 0) return;  // already initialized
+    hidden_ = hidden;
+    intermediate_ = intermediate;
+    device_index_ = device_index;
+    w_gate_ = Tensor::empty({intermediate, hidden}, DType::FP16,
+                             Device::cuda(device_index));
+    w_up_   = Tensor::empty({intermediate, hidden}, DType::FP16,
+                             Device::cuda(device_index));
+    w_down_ = Tensor::empty({hidden, intermediate}, DType::FP16,
+                             Device::cuda(device_index));
+    MI_CHECK_CUDA(cudaSetDevice(device_index));
+    cublasStatus_t s = cublasCreate(reinterpret_cast<cublasHandle_t*>(&cublas_handle_));
+    if (s != CUBLAS_STATUS_SUCCESS) {
+        throw std::runtime_error("cublasCreate failed");
+    }
+    MI_CHECK_CUBLAS(cublasSetMathMode(get_cublas(cublas_handle_),
+                                      CUBLAS_DEFAULT_MATH));
+}
+
 void MLP::set_weights(const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down) {
     auto need = [&](const Tensor& t, const std::vector<int64_t>& sh) {
         if (t.dtype() != DType::FP16) {

@@ -66,9 +66,9 @@ public:
     // Factory: allocates and owns memory.
     static Tensor empty(std::vector<int64_t> shape, DType dtype, Device device);
 
-    // Rule of five: copy is disallowed (would double-free), move is allowed.
-    Tensor(const Tensor&) = delete;
-    Tensor& operator=(const Tensor&) = delete;
+    // Rule of five: deep-copy (allocates fresh buffer); move is also allowed.
+    Tensor(const Tensor& other);
+    Tensor& operator=(const Tensor& other);
     Tensor(Tensor&& other) noexcept;
     Tensor& operator=(Tensor&& other) noexcept;
     ~Tensor();

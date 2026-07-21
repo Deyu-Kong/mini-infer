@@ -53,14 +53,17 @@ message(STATUS "  Generator      : ${CMAKE_GENERATOR}")
 message(STATUS "===========================================================")
 
 # -----------------------------------------------------------------------------
-# mini_infer_core library: Tensor, Allocator, basic CUDA helpers
+# mini_infer_core library: Tensor, Allocator, basic CUDA helpers, Graph
 # -----------------------------------------------------------------------------
 add_library(mini_infer_core STATIC
     src/core/tensor.cpp
     src/core/allocator.cpp
+    src/core/graph.cpp
+    src/model/model_config.cpp
 )
 target_include_directories(mini_infer_core
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
             ${CUDAToolkit_INCLUDE_DIRS}
 )
 target_link_libraries(mini_infer_core
@@ -117,6 +120,7 @@ add_library(mini_infer_layers STATIC
 )
 target_include_directories(mini_infer_layers
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
 )
 target_link_libraries(mini_infer_layers
     PUBLIC  mini_infer_core
@@ -125,6 +129,24 @@ target_link_libraries(mini_infer_layers
             m
 )
 mi_force_cuda(mini_infer_layers src/layers/mlp.cpp)
+
+# -----------------------------------------------------------------------------
+# mini_infer_model library: safetensors loader, QwenModel
+# -----------------------------------------------------------------------------
+add_library(mini_infer_model STATIC
+    src/model/safetensors_loader.cpp
+    src/model/qwen_model.cpp
+)
+target_include_directories(mini_infer_model
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann
+)
+target_link_libraries(mini_infer_model
+    PUBLIC  mini_infer_core
+            mini_infer_layers
+            ${CUBLAS_LIB}
+            m
+)
 
 # -----------------------------------------------------------------------------
 # Examples
