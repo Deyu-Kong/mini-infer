@@ -90,6 +90,91 @@ mini-infer/
 
 ---
 
-## Week 2 — 基础算子（占位）
+## Week 2 — 基础算子（2026-07-27 ~ 08-02）
 
-_TBD_
+**目标**：实现所有基础 CUDA kernel，每个 kernel 都要和 PyTorch 对拍验证。
+
+### 交付清单
+
+- [x] `kernels/rmsnorm_kernel.{cuh,cu}` — RMSNorm，warp shuffle 归约，FP16 存储 FP32 累加
+- [x] `kernels/rope_kernel.{cuh,cu}` — RoPE + cos/sin 预计算
+- [x] `kernels/softmax_kernel.{cuh,cu}` — 两遍 softmax（max + sum），数值稳定
+- [x] `kernels/swiglu_kernel.{cuh,cu}` — fused silu(gate) * up
+- [x] `layers/{rmsnorm,rope,mlp}.{h,cpp}` — 高层封装 + FP16/CUDA 校验
+- [x] `kernels/warp_reduce.cuh` — warp / block 级 sum/max 归约
+- [x] GEMM：`layers/mlp.cpp` 中调 `cublasGemmEx`，FP16 输入 FP32 累加
+- [x] `tests/verify/verify.py` — 通用 torch 对拍脚本（6 个 op）
+- [x] `tests/test_{rmsnorm,rope,softmax,swiglu,mlp}/` — 5 个 kernel 单测，全部 < 1e-3 误差
+- [x] `benchmarks/bench_kernels.cpp` — 单 kernel cudaEvent 计时
+- [x] `scripts/{build,run_tests}.sh` — 一键构建/测试（自动设环境变量）
+
+### 验收结果
+
+```
+$ scripts/run_tests.sh
+100% tests passed, 0 tests failed out of 7
+
+$ build/benchmarks/bench_kernels
+  rmsnorm N=4 D=3584              median=   6.14 us   p99=   8.19 us
+  rope B=4 S=512 H=28 D=128       median=  67.58 us   p99=  83.97 us
+  softmax N=57344 D=512           median= 176.13 us   p99= 191.49 us
+  swiglu N=2048 I=18944           median= 348.16 us   p99= 349.18 us
+```
+
+### 关键技术点
+
+- **RMSNorm**：warp shuffle 归约 + 一个 block-reduce 经 shared memory 收尾；
+  `rsqrtf(sum/D + eps)` 一次性拿到倒数避免一次除法。
+- **RoPE**：cos/sin 表形状 `[S, head_dim/2]`，kernel 按 `i < half` 遍历，同时更新
+  `y[i]` 与 `y[i+half]`。Qwen2.5 theta_base = 1000000。
+- **Softmax**：两遍 form，先算 max 再算 sum；分母 `1/sum` 一次算后广播。
+  Week 5 才会用 online 单遍形式（FlashAttention 用）。
+- **cuBLAS row-major trick**：`row_major(X)[i,j] == col_major(X^T)[j,i]`，
+  cuBLAS 看到的列主矩阵是我们行主矩阵的转置。要让 cuBLAS 算出
+  `C = A @ B`，需要 `OP_T` on cuBLAS-A (= our-B)，`OP_N` on cuBLAS-B (= our-A)。
+- **fp32 累加**：所有 kernel / GEMM 用 `CUBLAS_COMPUTE_32F`，FP16 仅做存储。
+
+### 踩坑
+
+1. **GEMM 错误的 layout**：第一版用 `OP_N` 双边，输出量级偏离 torch 参考 80×。
+   原因：cuBLAS 看到的 "row-B(N,K)" 是列主 (K, N)，需要 `OP_T` 才能拿到真正的
+   `B` 矩阵。修复后 max_abs < 5e-4 vs torch。
+2. **`#include "foo_kernel.cu"` in `foo.cpp`**：.cu 里的 `blockIdx` 等让 g++ 编译失败。
+   重构为 `.cuh`（声明） + `.cu`（实现）分离，layers/*.cpp 只 include `.cuh`。
+3. **`cast_to_f16` 模板显式特化在 nvcc 下报错**：nvcc 不允许带 `static` 的显式
+   特化。改成非模板静态函数。
+4. **链接时找不到 libm**：conda gcc 10.4 的 sysroot 缺 `libm.so.6`，
+   链接器走 `/usr/bin/ld` 但搜索路径是 conda 的 sysroot。
+   解决：显式 `target_link_libraries(... m)`，并设置 `CC/CXX/CUDAHOSTCXX` 指向
+   系统 gcc 9.3。
+5. **ctest 工作目录**：cmake 默认在 `build/tests/<test>/`，python verifier
+   用相对路径 `tests/verify/verify.py` 找不到。加 `WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}`。
+6. **rope Python 广播**：`x[B,S,H,half] * cos[S,half]` 默认右对齐得到
+   `[1,1,S,half]`，与 `[B,S,H,half]` 在 H 维冲突。改成 `cos.reshape(S,half).reshape(1,S,1,half)`。
+
+### 文件清单（本周末）
+
+```
+src/
+├── kernels/
+│   ├── warp_reduce.cuh           # warp/block 归约原语
+│   ├── rmsnorm_kernel.{cuh,cu}
+│   ├── rope_kernel.{cuh,cu}      # 含 cos/sin 预计算 kernel
+│   ├── softmax_kernel.{cuh,cu}
+│   └── swiglu_kernel.{cuh,cu}
+└── layers/
+    ├── rmsnorm.{h,cpp}
+    ├── rope.{h,cpp}
+    └── mlp.{h,cpp}               # 含 cuBLAS GEMM 行主适配
+
+tests/
+├── verify/verify.py              # 通用 torch 对拍脚本
+├── test_rmsnorm/
+├── test_rope/
+├── test_softmax/
+├── test_swiglu/
+└── test_mlp/
+
+benchmarks/bench_kernels.cpp      # cudaEvent 单 kernel 计时
+scripts/{build,run_tests}.sh      # 一键 build + ctest
+```

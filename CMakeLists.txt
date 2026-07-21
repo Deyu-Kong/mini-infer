@@ -38,6 +38,10 @@ set(CMAKE_CUDA_ARCHITECTURES ${MINI_INFER_CUDA_ARCH}
 
 find_package(CUDAToolkit 12.0 REQUIRED)
 
+# Locate cuBLAS / cuBLASLt for the Week 2 SwiGLU path.
+find_library(CUBLAS_LIB  NAMES cublas   PATHS ${CUDAToolkit_ROOT}/lib64 REQUIRED)
+find_library(CUBLASLT_LIB NAMES cublasLt PATHS ${CUDAToolkit_ROOT}/lib64)
+
 message(STATUS "===========================================================")
 message(STATUS "mini-infer build configuration")
 message(STATUS "  Build type     : ${CMAKE_BUILD_TYPE}")
@@ -62,6 +66,8 @@ target_include_directories(mini_infer_core
 target_link_libraries(mini_infer_core
     PUBLIC  CUDA::cudart
             CUDA::cuda_driver
+            ${CUBLAS_LIB}
+            m
 )
 # nvcc-friendly flags
 target_compile_options(mini_infer_core PRIVATE
@@ -82,9 +88,53 @@ mi_force_cuda(mini_infer_core
 )
 
 # -----------------------------------------------------------------------------
+# mini_infer_kernels library: hand-written CUDA kernels (Week 2+)
+# -----------------------------------------------------------------------------
+add_library(mini_infer_kernels STATIC
+    src/kernels/rmsnorm_kernel.cu
+    src/kernels/rope_kernel.cu
+    src/kernels/softmax_kernel.cu
+    src/kernels/swiglu_kernel.cu
+)
+target_include_directories(mini_infer_kernels
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_link_libraries(mini_infer_kernels
+    PUBLIC  mini_infer_core
+)
+target_compile_options(mini_infer_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr;-Xcompiler=-Wall>
+)
+
+# -----------------------------------------------------------------------------
+# mini_infer_layers library: MLP / RMSNorm / RoPE wrappers (Week 2+)
+# -----------------------------------------------------------------------------
+add_library(mini_infer_layers STATIC
+    src/layers/mlp.cpp
+    src/layers/rmsnorm.cpp
+    src/layers/rope.cpp
+)
+target_include_directories(mini_infer_layers
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(mini_infer_layers
+    PUBLIC  mini_infer_core
+            mini_infer_kernels
+            ${CUBLAS_LIB}
+            m
+)
+mi_force_cuda(mini_infer_layers src/layers/mlp.cpp)
+
+# -----------------------------------------------------------------------------
 # Examples
 # -----------------------------------------------------------------------------
 add_subdirectory(examples)
+
+# -----------------------------------------------------------------------------
+# Benchmarks
+# -----------------------------------------------------------------------------
+add_subdirectory(benchmarks)
 
 # -----------------------------------------------------------------------------
 # Tests

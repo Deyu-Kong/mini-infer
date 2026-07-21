@@ -1,0 +1,4 @@
+add_executable(bench_kernels bench_kernels.cpp)
+target_include_directories(bench_kernels PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(bench_kernels PRIVATE mini_infer_kernels mini_infer_core)
+set_source_files_properties(bench_kernels.cpp PROPERTIES LANGUAGE CUDA)
