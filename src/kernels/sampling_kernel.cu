@@ -229,5 +229,167 @@ void launch_top_p_sample_batched(const __half* /*logits*/, int /*B*/,
     // Not implemented in Week 6 — fall back to per-row greedy in callers.
 }
 
+// ===========================================================================
+// Speculative decoding accept/reject kernel (Week 7).
+//
+// For a single draft token position:
+//   p_target = softmax(target_logits)[draft_token]
+//   p_draft  = softmax(draft_logits)[draft_token]  (pre-computed)
+//   accept_prob = min(1, p_target / p_draft)
+//
+// If accepted: out_token = draft_token, out_accepted = 1
+// If rejected: sample from norm(max(0, p_target - p_draft)),
+//              out_token = corrected sample, out_accepted = 0
+//
+// Uses curand for GPU-side random number generation.
+// ===========================================================================
+#include <curand_kernel.h>
+
+__global__ void spec_accept_reject_kernel(
+    const __half* target_logits,
+    const __half* draft_logits,
+    int vocab,
+    int draft_token,
+    float draft_prob,
+    unsigned long long seed,
+    int* out_token,
+    int* out_accepted) {
+
+    extern __shared__ float smem[];
+    float* target_probs = smem;
+    float* draft_probs  = smem + vocab;
+
+    int tid = threadIdx.x;
+
+    float t_max = -INFINITY;
+    float d_max = -INFINITY;
+    for (int i = tid; i < vocab; i += blockDim.x) {
+        float tv = __half2float(target_logits[i]);
+        float dv = __half2float(draft_logits[i]);
+        if (tv > t_max) t_max = tv;
+        if (dv > d_max) d_max = dv;
+    }
+
+    __shared__ float reduce_buf[256];
+    reduce_buf[tid] = t_max;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) reduce_buf[tid] = fmaxf(reduce_buf[tid], reduce_buf[tid + o]);
+        __syncthreads();
+    }
+    float target_max = reduce_buf[0];
+
+    reduce_buf[tid] = d_max;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) reduce_buf[tid] = fmaxf(reduce_buf[tid], reduce_buf[tid + o]);
+        __syncthreads();
+    }
+    float draft_max = reduce_buf[0];
+    __syncthreads();
+
+    float t_sum = 0.0f;
+    float d_sum = 0.0f;
+    for (int i = tid; i < vocab; i += blockDim.x) {
+        float tp = __expf(__half2float(target_logits[i]) - target_max);
+        float dp = __expf(__half2float(draft_logits[i]) - draft_max);
+        target_probs[i] = tp;
+        draft_probs[i] = dp;
+        t_sum += tp;
+        d_sum += dp;
+    }
+
+    reduce_buf[tid] = t_sum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) reduce_buf[tid] += reduce_buf[tid + o];
+        __syncthreads();
+    }
+    float target_sum = reduce_buf[0];
+
+    reduce_buf[tid] = d_sum;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (tid < o) reduce_buf[tid] += reduce_buf[tid + o];
+        __syncthreads();
+    }
+    float draft_sum = reduce_buf[0];
+    __syncthreads();
+
+    for (int i = tid; i < vocab; i += blockDim.x) {
+        target_probs[i] /= target_sum;
+        draft_probs[i] /= draft_sum;
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        curandStatePhilox4_32_10_t state;
+        curand_init(seed, 0, 0, &state);
+        float u = curand_uniform(&state);
+
+        float p_t = (draft_token >= 0 && draft_token < vocab)
+                    ? target_probs[draft_token] : 0.0f;
+        float p_d = draft_prob;
+
+        float accept_prob = (p_d > 1e-8f) ? fminf(1.0f, p_t / p_d) : 1.0f;
+
+        if (u < accept_prob) {
+            *out_token = draft_token;
+            *out_accepted = 1;
+        } else {
+            float corrected_sum = 0.0f;
+            for (int i = 0; i < vocab; ++i) {
+                float c = fmaxf(0.0f, target_probs[i] - draft_probs[i]);
+                corrected_sum += c;
+            }
+
+            if (corrected_sum <= 0.0f) {
+                int best = 0;
+                float best_val = target_probs[0];
+                for (int i = 1; i < vocab; ++i) {
+                    if (target_probs[i] > best_val) {
+                        best_val = target_probs[i];
+                        best = i;
+                    }
+                }
+                *out_token = best;
+            } else {
+                float u2 = curand_uniform(&state);
+                float cum = 0.0f;
+                int chosen = vocab - 1;
+                for (int i = 0; i < vocab; ++i) {
+                    float c = fmaxf(0.0f, target_probs[i] - draft_probs[i])
+                              / corrected_sum;
+                    cum += c;
+                    if (u2 <= cum) { chosen = i; break; }
+                }
+                *out_token = chosen;
+            }
+            *out_accepted = 0;
+        }
+    }
+}
+
+void launch_spec_accept_reject(
+    const __half* target_logits,
+    const __half* draft_logits,
+    int vocab,
+    int draft_token,
+    float draft_prob,
+    unsigned long long seed,
+    int* out_token,
+    int* out_accepted,
+    cudaStream_t stream) {
+
+    constexpr int BLOCK = 256;
+    size_t smem = 2 * vocab * sizeof(float) + BLOCK * sizeof(float);
+    if (vocab > 30000) {
+        smem = 2 * vocab * sizeof(float) + BLOCK * sizeof(float);
+    }
+    spec_accept_reject_kernel<<<1, BLOCK, smem, stream>>>(
+        target_logits, draft_logits, vocab, draft_token,
+        draft_prob, seed, out_token, out_accepted);
+}
+
 }  // namespace kernels
 }  // namespace mini_infer

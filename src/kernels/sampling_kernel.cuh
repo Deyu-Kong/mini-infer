@@ -35,5 +35,25 @@ void launch_top_p_sample_batched(const __half* logits, int B, int vocab,
                                  unsigned long long seed,
                                  int* out, cudaStream_t stream);
 
+// Week 7: Speculative decoding accept/reject kernel.
+//   target_logits : [vocab] FP16 — target model logits for this position
+//   draft_logits  : [vocab] FP16 — draft model logits for this position
+//   vocab         : vocabulary size
+//   draft_token   : the token sampled by the draft model
+//   draft_prob    : the draft model's probability for draft_token
+//   seed          : curand seed
+//   out_token     : [1] int32 — accepted token or corrected sample
+//   out_accepted  : [1] int32 — 1 if accepted, 0 if rejected
+void launch_spec_accept_reject(
+    const __half* target_logits,
+    const __half* draft_logits,
+    int vocab,
+    int draft_token,
+    float draft_prob,
+    unsigned long long seed,
+    int* out_token,
+    int* out_accepted,
+    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace mini_infer

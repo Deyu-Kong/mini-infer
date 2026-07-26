@@ -62,8 +62,9 @@ __global__ void naive_attn_kernel(
     __syncthreads();
 
     // -------- compute scores for each key position -----------------------
+    const int causal_offset = S_k - S_q;  // = cur_len for verify/prefill
     for (int j = 0; j < S_k; ++j) {
-        if (is_prefill && j > sq) {
+        if (is_prefill && j > sq + causal_offset) {
             scores[j] = -INFINITY;
             continue;
         }

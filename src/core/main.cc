@@ -8,6 +8,7 @@
  *       [--temperature 1.0 --top-p 0.9 --seed 42] \
  *       [--max-seq-len 2048 --device 0]
  *       [--paged]                                # Week 5: use PagedAttention
+ *       [--spec-draft /path/to/Qwen2.5-0.5B-Instruct --gamma 4]  # Week 7
  *
  * For Qwen2.5, the model directory must contain:
  *   config.json, tokenizer.json, model-*.safetensors
@@ -27,6 +28,8 @@
 #include "model/model_config.h"
 #include "model/qwen_model.h"
 #include "model/safetensors_loader.h"
+#include "speculative/draft_engine.h"
+#include "speculative/spec_decoder.h"
 
 namespace {
 struct Args {
@@ -40,6 +43,8 @@ struct Args {
     bool    greedy         = false;
     bool    paged          = false;
     uint64_t seed          = 42;
+    std::string spec_draft_dir;
+    int     gamma          = 4;
 };
 
 Args parse_args(int argc, char** argv) {
@@ -63,11 +68,14 @@ Args parse_args(int argc, char** argv) {
         else if (s == "--greedy")        a.greedy         = true;
         else if (s == "--paged")         a.paged          = true;
         else if (s == "--seed")          a.seed           = std::stoull(need(s));
+        else if (s == "--spec-draft")    a.spec_draft_dir = need(s);
+        else if (s == "--gamma")         a.gamma          = std::stoi(need(s));
         else if (s == "-h" || s == "--help") {
             std::printf(
                 "Usage: %s --model DIR [--prompt T] [--max-new-tokens N] "
                 "[--max-seq-len M] [--device D] [--temperature T] [--top-p P] "
-                "[--greedy] [--paged] [--seed S]\n",
+                "[--greedy] [--paged] [--seed S] "
+                "[--spec-draft DRAFT_DIR] [--gamma G]\n",
                 argv[0]);
             std::exit(0);
         }
@@ -122,15 +130,6 @@ int main(int argc, char** argv) {
     
 
     
-    mini_infer::Engine engine(model, args.max_seq_len, args.device);
-    if (args.greedy) {
-        engine.set_sampling(mini_infer::SamplingMode::Greedy);
-    } else {
-        engine.set_sampling(mini_infer::SamplingMode::TopP,
-                            args.top_p, args.temperature, args.seed);
-    }
-    
-
     // Build chat-formatted prompt for Qwen2.5 (ChatML).
     
     std::vector<int64_t> prompt_ids;
@@ -156,22 +155,76 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    
     auto t0 = std::chrono::high_resolution_clock::now();
     std::vector<int64_t> out_ids;
-    if (args.paged) {
-        out_ids = engine.generate_paged(prompt_ids, args.max_new_tokens, stop_ids);
+
+    if (!args.spec_draft_dir.empty()) {
+        // Speculative decoding path (Week 7)
+        std::printf("[mini-infer] loading draft model from %s ...\n",
+                    args.spec_draft_dir.c_str());
+        auto draft_cfg = mini_infer::ModelConfig::load(
+            args.spec_draft_dir + "/config.json");
+        std::printf("  Draft: H=%ld I=%ld L=%ld Hq=%ld Hkv=%ld V=%ld\n",
+                    draft_cfg.hidden_size, draft_cfg.intermediate_size,
+                    draft_cfg.num_hidden_layers,
+                    draft_cfg.num_attention_heads * draft_cfg.head_dim(),
+                    draft_cfg.num_key_value_heads * draft_cfg.kv_head_dim(),
+                    draft_cfg.vocab_size);
+
+        auto draft_weight_idx = mini_infer::WeightIndex::load(
+            args.spec_draft_dir);
+        auto draft_model = std::make_shared<mini_infer::QwenModel>(
+            draft_cfg, args.device);
+        draft_model->load_weights(draft_weight_idx);
+
+        auto draft_engine = std::make_shared<mini_infer::DraftEngine>(
+            draft_model, args.max_seq_len, args.device);
+
+        mini_infer::SpecDecoder spec_decoder(
+            model, draft_engine, args.max_seq_len, args.gamma, args.device);
+
+        if (args.greedy) {
+            spec_decoder.set_sampling_greedy();
+        } else {
+            spec_decoder.set_sampling_top_p(args.top_p, args.temperature,
+                                             args.seed);
+        }
+
+        out_ids = spec_decoder.generate(prompt_ids, args.max_new_tokens,
+                                         stop_ids);
+
+        const auto& stats = spec_decoder.stats();
+        std::printf("[spec-decode] accepted=%ld rejected=%ld draft=%ld "
+                    "accept_rate=%.2f%%\n",
+                    stats.total_accepted, stats.total_rejected,
+                    stats.total_draft, stats.accept_rate() * 100.0);
     } else {
-        out_ids = engine.generate(prompt_ids, args.max_new_tokens, stop_ids);
+        mini_infer::Engine engine(model, args.max_seq_len, args.device);
+        if (args.greedy) {
+            engine.set_sampling(mini_infer::SamplingMode::Greedy);
+        } else {
+            engine.set_sampling(mini_infer::SamplingMode::TopP,
+                                args.top_p, args.temperature, args.seed);
+        }
+
+        if (args.paged) {
+            out_ids = engine.generate_paged(prompt_ids, args.max_new_tokens,
+                                             stop_ids);
+        } else {
+            out_ids = engine.generate(prompt_ids, args.max_new_tokens,
+                                       stop_ids);
+        }
     }
+
     auto t1 = std::chrono::high_resolution_clock::now();
     double secs = std::chrono::duration<double>(t1 - t0).count();
     
 
-    int64_t gen = static_cast<int64_t>(out_ids.size()) - engine.prompt_len();
+    int64_t gen = static_cast<int64_t>(out_ids.size()) - prompt_ids.size();
     
     
-    std::vector<int64_t> gen_ids(out_ids.begin() + engine.prompt_len(), out_ids.end());
+    std::vector<int64_t> gen_ids(out_ids.begin() + prompt_ids.size(),
+                                  out_ids.end());
     std::string gen_text = tok.decode(gen_ids);
 
     std::printf("\n--- generated ---\n%s\n--- end ---\n", gen_text.c_str());

@@ -175,10 +175,31 @@ target_link_libraries(mini_infer_engine
 mi_force_cuda(mini_infer_engine src/core/engine.cpp src/scheduler/scheduler.cpp)
 
 # -----------------------------------------------------------------------------
+# mini_infer_speculative library: DraftEngine, SpecDecoder (Week 7)
+# -----------------------------------------------------------------------------
+add_library(mini_infer_speculative STATIC
+    src/speculative/draft_engine.cpp
+    src/speculative/spec_decoder.cpp
+)
+target_include_directories(mini_infer_speculative
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${CUDAToolkit_INCLUDE_DIRS}
+)
+target_link_libraries(mini_infer_speculative
+    PUBLIC  mini_infer_engine
+            mini_infer_kernels
+            curand
+)
+mi_force_cuda(mini_infer_speculative
+    src/speculative/draft_engine.cpp
+    src/speculative/spec_decoder.cpp
+)
+
+# -----------------------------------------------------------------------------
 # mini_infer executable: CLI entry point
 # -----------------------------------------------------------------------------
 add_executable(mini_infer src/core/main.cc)
-target_link_libraries(mini_infer PRIVATE mini_infer_engine)
+target_link_libraries(mini_infer PRIVATE mini_infer_engine mini_infer_speculative)
 set_source_files_properties(src/core/main.cc PROPERTIES LANGUAGE CUDA)
 
 # -----------------------------------------------------------------------------
