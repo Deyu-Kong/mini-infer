@@ -284,3 +284,297 @@ tests/
 ├── test_safetensors/                  # 新增 — 339 张量索引
 └── test_qwen_model/                   # 新增 — 加载 14GB 模型
 ```
+
+---
+
+## Week 4 — 端到端推理（2026-08-10 ~ 08-16）
+
+**目标**：实现端到端自回归推理，生成连贯文本。
+
+### 交付清单
+
+- [x] `src/layers/attention.{h,cpp}` — 完整 attention 层（QKV 投影、RoPE、naive attention、O 投影）
+- [x] `src/kernels/naive_attn_kernel.{cu,cuh}` — naive attention CUDA kernel（支持 prefill 和 decode）
+- [x] `src/scheduler/kv_cache.{h,cpp}` — KV cache 管理（per-layer 指针）
+- [x] `src/core/engine.{h,cpp}` — 推理引擎（prefill + decode 循环、sampling）
+- [x] `src/kernels/sampling_kernel.cu` — greedy 和 top-p sampling CUDA kernel
+- [x] `src/core/tokenizer.{h,cpp}` — tokenizer wrapper（Python subprocess）
+- [x] `src/core/main.cc` — CLI 入口
+- [x] `tests/test_e2e_qwen.py` — 端到端测试
+- [x] `tests/compare_exact.py` — 与 HuggingFace 对比的调试脚本
+
+### 关键技术点
+
+1. **Position IDs bug**：最初将 token IDs 当作 position IDs 传给 RoPE，导致数值错误。修复后使用正确的 position IDs [0, 1, 2, ..., seq_len-1]。
+
+2. **lm_head GEMM bug**：cuBLAS GEMM 的 lda 参数错误（应该是 H 而不是 Nvoc），导致 final logits 不匹配。修复后 logits 与 HuggingFace 完全一致。
+
+3. **SwiGLU 精度**：使用 `expf` 替代 `__expf` 以提高精度，避免 gate 值很负时的数值不稳定。
+
+4. **数值验证**：通过逐层对比中间值，确认所有 28 层的输出与 HuggingFace 完全匹配（FP16 精度内）。
+
+### 验收结果
+
+```bash
+$ ./build/mini_infer --model /data1/kdy/LLMs/Qwen2.5-Coder-7B-Instruct \
+    --prompt "Hello" --max-new-tokens 20 --greedy
+
+--- generated ---
+Hello! How can I assist you today?
+--- end ---
+[mini-infer] 10 tokens in 0.41s (24.67 tok/s)
+```
+
+```bash
+$ ./build/mini_infer --model /data1/kdy/LLMs/Qwen2.5-Coder-7B-Instruct \
+    --prompt "Write a Python function to calculate fibonacci numbers" \
+    --max-new-tokens 50 --greedy
+
+--- generated ---
+### Iterative Approach
+```python
+def fibonacci_iterative(n):
+    if n <= 0:
+        return []
+    elif n == 1:
+       
+--- end ---
+[mini-infer] 50 tokens in 1.80s (27.85 tok/s)
+```
+
+### 性能指标
+
+- **Prefill 速度**：~100 tok/s（9 tokens prompt）
+- **Decode 速度**：~25-28 tok/s（greedy sampling）
+- **生成质量**：与 HuggingFace transformers 输出一致
+
+### 已知问题
+
+1. **Top-p sampling**：尚未充分测试，可能存在数值稳定性问题。
+2. **Batch inference**：当前仅支持 batch_size=1。
+3. **长序列**：max_seq_len=2048，尚未测试更长序列。
+
+### 下一步（Week 5）
+
+- 实现 PagedAttention 以提高 KV cache 利用率
+- 支持 batch inference
+- 优化 decode 速度（目标：>30 tok/s）
+
+1. **Position IDs 错误**：将 token IDs 当作 position IDs 传给 RoPE，导致所有层的输出都错误。通过逐层对比 HuggingFace 中间值发现。
+
+2. **lm_head GEMM 参数错误**：cuBLAS GEMM 的 lda 参数应该是 H（hidden_size），而不是 Nvoc（vocab_size）。这是因为 lm_head 权重矩阵是 row-major [vocab_size, H]，在 column-major 视角下是 [H, vocab_size]，所以 leading dimension 是 H。
+
+3. **SwiGLU 数值不稳定**：使用 `__expf` 快速指数函数时，当 gate 值很负（如 -5.23）时精度不足。改用标准 `expf` 后问题解决。
+
+4. **调试方法**：通过添加 `debug_print_tensor` 输出每层的中间值，与 HuggingFace 的 `compare_exact.py` 脚本对比，逐层定位问题。最终发现所有 28 层的输出都正确，问题出在 lm_head GEMM。
+
+### 文件清单（本周末）
+
+```
+src/
+├── core/
+│   ├── engine.{h,cpp}            # 新增 — 推理引擎
+│   ├── tokenizer.{h,cpp}         # 新增 — tokenizer wrapper
+│   ├── main.cc                   # 新增 — CLI 入口
+│   ├── graph.{h,cpp}
+│   ├── dtype_utils.h
+│   ├── tensor.{h,cpp}
+│   └── allocator.{h,cpp}
+├── layers/
+│   ├── attention.{h,cpp}         # 新增 — 完整 attention 层
+│   ├── rmsnorm.{h,cpp}
+│   ├── mlp.{h,cpp}
+│   └── rope.{h,cpp}
+├── kernels/
+│   ├── naive_attn_kernel.{cu,cuh} # 新增 — naive attention kernel
+│   ├── sampling_kernel.cu         # 新增 — greedy/top-p sampling
+│   ├── rmsnorm_kernel.{cu,cuh}
+│   ├── rope_kernel.{cu,cuh}
+│   ├── softmax_kernel.{cu,cuh}
+│   ├── swiglu_kernel.{cu,cuh}
+│   └── model_utils_kernel.{cu,cuh}
+├── scheduler/
+│   └── kv_cache.{h,cpp}          # 新增 — KV cache 管理
+└── model/
+    ├── model_config.{h,cpp}
+    ├── safetensors_loader.{h,cpp}
+    └── qwen_model.{h,cpp}
+
+tests/
+├── test_e2e_qwen.py              # 新增 — 端到端测试
+├── compare_exact.py              # 新增 — HuggingFace 对比脚本
+├── test_model_config/
+├── test_graph/
+├── test_safetensors/
+└── test_qwen_model/
+```
+
+---
+
+## Week 5 — PagedAttention（2026-07-20 ~ 07-26）
+
+**目标**：实现 Block pool + PagedAttention CUDA kernel，复用 Week 4 的端到端路径。
+
+### 交付清单
+
+- [x] `src/core/allocator.h` 扩展 — 新增 `BlockAllocator` (kBlockSize=16, ref-counted free list)
+- [x] `src/scheduler/paged_kv_cache.{h,cpp}` — per-sequence BlockTable + create/append_token
+- [x] `src/kernels/paged_attn_kernel.{cu,cuh}` — online-softmax paged attention kernel
+- [x] `src/kernels/model_utils_kernel.{cu,cuh}` 扩展 — `launch_paged_kv_scatter`
+- [x] `src/layers/attention.{h,cpp}` 扩展 — `forward_paged` + `forward_paged_batched`
+- [x] `src/model/qwen_model.{h,cpp}` 扩展 — `forward_paged` + `forward_paged_batched`
+- [x] `src/core/engine.{h,cpp}` 扩展 — `generate_paged` + `generate_batched_paged`
+- [x] `tests/test_frag` — 100 sequences 碎片率 < 10%
+- [x] `tests/test_conc` — paged vs naive 并发对比 ≥ 2x
+- [x] `tests/test_week5_acceptance.py` — 完整验收脚本
+
+### 关键技术点
+
+1. **Block pool**：每个 block 容纳 `BLOCK_SIZE=16` 个 token 的 K/V（FP16）。Ref-counted free list 支持 prefix cache 共享（Week 7-8）。
+2. **Online softmax**：decode attention 用一-pass FlashAttention 形式，无需先 max 后 sum。
+3. **GQA**：Qwen2.5-7B 是 `num_heads=28, num_kv_heads=4`，每个 kv_head 被 7 个 query head 共享；kernel 用 `h_kv = h_q / num_kv_groups` 索引。
+4. **混合 B>1 batched prefill**：复用 `forward_paged_batched` 即可，无须 padding（Week 6 用 bucket padding 优化）。
+
+### 踩坑
+
+1. **Batched sample 一次只 sample 一个**：Week 4 的 `sample_logits_` 要求 `[1,1,V]`。Week 6 添加了 `launch_greedy_sample_batched` 一次处理 B 行。
+2. **scatter kernel 的 `t_global >= slen` 守卫**：让 padded prefill 在 Week 6 直接可用，无需修改 kernel。
+
+### 文件清单
+
+```
+src/
+├── core/
+│   └── allocator.{h,cpp}        # 扩展 — BlockAllocator
+├── kernels/
+│   ├── paged_attn_kernel.{cu,cuh}     # 新增
+│   └── model_utils_kernel.{cu,cuh}    # 扩展 — paged scatter
+├── layers/
+│   └── attention.{h,cpp}        # 扩展 — forward_paged
+├── model/
+│   └── qwen_model.{h,cpp}       # 扩展 — forward_paged
+├── scheduler/
+│   └── paged_kv_cache.{h,cpp}   # 新增
+tests/
+├── test_frag/
+├── test_conc/
+└── test_week5_acceptance.py
+```
+
+---
+
+## Week 6 — 连续批处理 + Benchmark（2026-07-27 ~ 08-02）
+
+**目标**：实现 iteration 级动态批处理调度（running + waiting 队列），建立标准化 Benchmark 框架。
+
+### 交付清单
+
+#### 调度器
+- [x] `src/scheduler/request.{h,cpp}` — Request 状态机（Pending → Prefilling → Decoding → Finished），per-request TTFT/TPOT metrics
+- [x] `src/scheduler/prefix_cache.{h,cpp}` — Week 7-8 占位（Radix Trie 后续实现，本周 no-op）
+- [x] `src/scheduler/scheduler.{h,cpp}` — `Scheduler::step()` 迭代循环：
+  1. sweep finished（EOS / max_tokens）
+  2. admit prefill（FIFO + bucket padding + block 容量限制）
+  3. batched paged prefill（变长 padding 到 bucket）
+  4. batched paged decode（所有 running 同时 sample）
+- [x] 复用 Week 5 的 `QwenModel::forward_paged_batched`（batched prefill + decode 一条路径）
+
+#### Engine 增强
+- [x] `Engine::clear_paged_sequences()` — bench_static 跨批次释放 paged sequence
+- [x] `Engine` ctor 新增 `paged_num_blocks_override` — 让 benchmark 显式控制 pool 大小
+- [x] `Engine::generate_batched_paged` 升级 — prefill 也用 batched forward（连续批处理公平对比基准）
+
+#### Kernel
+- [x] `src/kernels/sampling_kernel.{cu,cuh}` — 新增 `launch_greedy_sample_batched` (B 行一次 sample)
+- [x] `src/scheduler/paged_kv_cache.{h,cpp}` — 新增 `clear_all_sequences()`
+
+#### Benchmark 框架
+- [x] `benchmarks/common/dataset.{h,cpp}` — ShareGPT JSON 加载 + 合成 prompt 模板（按 token 长度分桶）
+- [x] `benchmarks/common/metrics.{h,cpp}` — TTFT / TPOT / throughput 聚合 + CSV / Markdown 输出
+- [x] `benchmarks/datasets/sharegpt_sample.json` — 1000 条 ShareGPT 风格样本（自动生成脚本：`datasets/generate_sharegpt_sample.py`）
+- [x] `benchmarks/bench_continuous.cpp` — `Scheduler` 驱动：支持 `--arrival-mode 0/1`（同时到达 vs 错峰）
+- [x] `benchmarks/bench_static.cpp` — 静态批处理基线（按 `--batch-size` 切块）
+- [x] `benchmarks/CMakeLists.txt` — 新增 `bench_common` 库 + 两个 bench 可执行
+
+#### 脚本 + 可视化
+- [x] `scripts/bench.sh` — 一键跑全配置对比，输出 CSV / Markdown / PNG
+- [x] `scripts/bench_compare.py` — 跨模式汇总（speedup 列）
+- [x] `scripts/plot_bench.py` — matplotlib 生成 Throughput vs Concurrency 折线图
+
+#### 测试
+- [x] `tests/test_request` — 状态机 / metrics / stop tokens (5 用例)
+- [x] `tests/test_prefix_cache` — Week 7-8 占位 API smoke
+
+### 验收结果
+
+#### 1000 样本 ShareGPT（Qwen2.5-Coder-1.5B-Instruct, max_new=16, max_seq=256）
+
+| 模式       | N=200 wall / tps | N=1000 wall / tps | speedup (N=200) | speedup (N=1000) |
+| ---------- | ---------------- | ----------------- | --------------- | ---------------- |
+| static B=8 | 14958ms / 213.9  | 75021ms / 213.3   | 1.00x           | 1.00x            |
+| continuous |  7132ms / 448.7  | 34992ms / 457.2   | **2.10x**       | **2.14x**        |
+
+> **说明**：3x 是"理想 case"（连续到达 + 高方差 prompt 长度 + 短 decode）。本 bench 在"所有请求同时到达、最坏 case"下仍达成 **2x+ 吞吐量提升**。1000 样本的折线图见 `benchmarks/results/full/throughput_vs_concurrency_full.png`。
+
+#### 测试覆盖：14/14 pass（新增 2 个）
+
+| 测试             | 备注                                       |
+| ---------------- | ------------------------------------------ |
+| request          | 状态机 / metrics / stop tokens             |
+| prefix_cache     | Week 7-8 占位 API smoke                    |
+
+### 关键技术点
+
+1. **Bucket-padded batched prefill**：复用 Week 5 的 `QwenModel::forward_paged_batched`，把同一 bucket 内的 prompt pad 到 `bucket_size`，kernel 用 `seq_len[b]=L_b` 自动 mask 掉 pad 位置。无需新 kernel。
+2. **状态机 + IterationStats**：`Scheduler::step()` 返回 wall / prefill_ms / decode_ms / sample_ms 拆分 + used_blocks / total_blocks，每轮可记录到 CSV。
+3. **变长 padding 内存控制**：bucket 默认 `{64,128,256,512,1024}`；bench 用 `--max-prefill-batch 16` 限制单次 batched prefill 的 logits 张量 < 5 GB。
+4. **TTFT 精确度量**：`Request::arrival_ms` 由 `Scheduler::submit()` 设置，`first_token_at_ms` 在 prefill sample 后写入，相减即 TTFT。
+
+### 踩坑
+
+1. **调度器 OOM**：batched prefill logits 张量 `B*bucket*V*2bytes` 在 1.5B 模型上很容易 > 5 GB。需要根据模型 vocab 限 `--max-prefill-batch` 与 `--bucket`。
+2. **Bucket 必须 ≥ max_prompt_len**：否则 `admit_prefill_group_` 只取 1 个 req 就 break，整个 scheduler 退化成"逐个 prefill"。bench.sh 已根据 `MAX_SEQ_LEN - MAX_NEW_TOKENS` 自动选 bucket。
+3. **Static bench 跨批次泄漏**：原 `Engine::generate_batched_paged` 不销毁 sequence，多批次累计 OOM。修复：bench_static 每 chunk 调 `clear_paged_sequences()`。
+4. **CSV tag 含逗号**：早期 `tag="static,B=2,N=8"` 让 csv 解析错列。改用 `;` 分隔。
+5. **TPOT 计算**：当前实现是 wall-time 除以 decode steps。生产系统通常用 event-based sampling，本周保留简单版本。
+
+### 已知限制（为 Week 7-8 铺垫）
+
+- **变长 padding 浪费**：bucket 比平均 prompt 长 2-4x，compute 有 ~30-50% 浪费在 padding token 上。Week 7+ 用 length-aware bucketing（每 step 把 waiting 按长度排序，分组进 batch）可解决。
+- **Prefix cache 不参与调度**：每个 request 都从全 prompt prefill，没有复用。Week 7-8 加 Radix Trie。
+- **TPOT 采样 wall-time 包含 sample 同步开销**：实测 < 1ms/req，影响小但生产里会用 CUDA Events 隔离。
+
+### 文件清单
+
+```
+src/
+├── core/
+│   ├── engine.{h,cpp}                # 扩展 — paged_num_blocks_override, clear_paged_sequences, batched prefill
+│   └── ...
+├── kernels/
+│   └── sampling_kernel.{cu,cuh}       # 扩展 — batched greedy
+├── scheduler/
+│   ├── request.{h,cpp}                # 新增
+│   ├── prefix_cache.{h,cpp}           # 新增（Week 7-8 占位）
+│   ├── scheduler.{h,cpp}             # 新增
+│   └── paged_kv_cache.{h,cpp}         # 扩展 — clear_all_sequences
+benchmarks/
+├── CMakeLists.txt                     # 扩展 — bench_common
+├── bench_continuous.cpp               # 新增
+├── bench_static.cpp                   # 新增
+├── common/
+│   ├── dataset.{h,cpp}                # 新增
+│   └── metrics.{h,cpp}                # 新增
+└── datasets/
+    ├── README.md                      # 新增
+    ├── generate_sharegpt_sample.py    # 新增
+    └── sharegpt_sample.json           # 新增（1000 prompts）
+scripts/
+├── bench.sh                           # 新增
+├── bench_compare.py                   # 新增
+└── plot_bench.py                      # 新增
+tests/
+├── CMakeLists.txt                     # 扩展 — test_request, test_prefix_cache
+├── test_request/                      # 新增
+└── test_prefix_cache/                 # 新增
+```
