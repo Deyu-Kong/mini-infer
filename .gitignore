@@ -56,4 +56,6 @@ data/
 
 # Profiling
 *.qdrep
-*.qdstrm
+*.qdstrmbench_batched
+conc_test
+frag_test

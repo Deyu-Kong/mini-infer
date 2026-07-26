@@ -12,6 +12,9 @@ add_subdirectory(test_model_config)
 add_subdirectory(test_graph)
 add_subdirectory(test_safetensors)
 add_subdirectory(test_qwen_model)
+add_subdirectory(test_paged_attention)
+add_subdirectory(test_request)
+add_subdirectory(test_prefix_cache)
 
 # Ensure the python verifier is discoverable from tests.
 set(MINI_INFER_PYTHON "python3" CACHE STRING "Python interpreter used for verification")
