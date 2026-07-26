@@ -79,6 +79,33 @@ int PagedKVCache::append_token(int seq_id) {
     return pos;
 }
 
+void PagedKVCache::rollback(int seq_id, int new_num_tokens) {
+    auto it = tables_.find(seq_id);
+    if (it == tables_.end()) {
+        throw std::runtime_error("PagedKVCache::rollback: unknown seq_id");
+    }
+    BlockTable& t = it->second;
+    if (new_num_tokens > t.num_tokens) {
+        throw std::runtime_error("PagedKVCache::rollback: cannot grow");
+    }
+    if (new_num_tokens < 0) {
+        new_num_tokens = 0;
+    }
+    
+    // Calculate how many blocks we need for new_num_tokens
+    const int needed_blocks = (new_num_tokens + BlockAllocator::kBlockSize - 1) 
+                              / BlockAllocator::kBlockSize;
+    
+    // Free blocks that are no longer needed
+    while (static_cast<int>(t.block_ids.size()) > needed_blocks) {
+        int b = t.block_ids.back();
+        t.block_ids.pop_back();
+        allocator_.free(b);
+    }
+    
+    t.num_tokens = new_num_tokens;
+}
+
 void* PagedKVCache::k_ptr_for(int seq_id, int layer, int token_pos) {
     auto it = tables_.find(seq_id);
     if (it == tables_.end()) {

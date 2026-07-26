@@ -69,6 +69,12 @@ public:
     // logical position (== num_tokens before append) or -1 on OOM.
     int append_token(int seq_id);
 
+    // Rollback the sequence to a previous token count. Frees any blocks
+    // that become completely empty. Used by speculative decoding when
+    // draft tokens are rejected.
+    //   new_num_tokens: target token count (must be <= current num_tokens)
+    void rollback(int seq_id, int new_num_tokens);
+
     // K / V storage pointer for sequence `seq_id`, layer `layer`, kv
     // position `token_pos` (in [0, num_tokens)).  Caller is responsible
     // for not writing past `head_dim` elements per token.

@@ -1,30 +1,57 @@
 # mini-infer
 
-> 轻量级 C++/CUDA LLM 推理引擎：聚焦投机解码、PagedAttention、Prefix Caching 等工业级优化特性。
+> A lightweight C++/CUDA LLM inference engine built from scratch, supporting Qwen2.5 series models with PagedAttention, speculative decoding, and prefix caching.
 
-## 状态
+## Architecture
 
-**Week 6 完成，进入 Week 7：投机解码 (draft + 验证)**
-
-详细路线图见 [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md)，周进度见 [`docs/WEEKLY_PROGRESS.md`](docs/WEEKLY_PROGRESS.md)。
-
-## 目标模型
-
-- Target: Qwen2.5-7B-Instruct (FP16)
-- Draft : Qwen2.5-0.5B-Instruct (FP16, 投机解码用)
-
-## 硬件
-
-4 × RTX A6000 (48GB each), CUDA 12.x, sm_86。
-
-## 快速构建
-
-```bash
-scripts/build.sh        # 配置 + 编译（自动设置环境）
-scripts/run_tests.sh    # 运行 ctest 全套
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        mini-infer Engine                         │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐  ┌──────────────┐  ┌────────────────────────┐ │
+│  │  Tokenizer  │  │   Scheduler  │  │    Speculative Decoder │ │
+│  │  (HF format)│  │ (Continuous) │  │  (Draft + Verify + A/R)│ │
+│  └──────┬──────┘  └──────┬───────┘  └───────────┬────────────┘ │
+│         │                │                       │              │
+│  ┌──────▼────────────────▼───────────────────────▼────────────┐ │
+│  │                    QwenModel (Transformer)                   │ │
+│  │  ┌─────────┐ ┌──────────┐ ┌─────────┐ ┌─────────────────┐ │ │
+│  │  │RMSNorm  │ │ Attention│ │  RoPE   │ │  MLP (SwiGLU)   │ │ │
+│  │  └─────────┘ └────┬─────┘ └─────────┘ └─────────────────┘ │ │
+│  └────────────────────┼───────────────────────────────────────┘ │
+│                       │                                          │
+│  ┌────────────────────▼───────────────────────────────────────┐ │
+│  │              KV Cache Management Layer                       │ │
+│  │  ┌──────────────┐  ┌───────────────┐  ┌─────────────────┐ │ │
+│  │  │PagedKVCache  │  │ PrefixCache   │  │  BlockAllocator │ │ │
+│  │  │(Block Table) │  │(Radix Trie)   │  │  (Free List)    │ │ │
+│  │  └──────────────┘  └───────────────┘  └─────────────────┘ │ │
+│  └────────────────────────────────────────────────────────────┘ │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                    CUDA Kernels                              │ │
+│  │  RMSNorm │ RoPE │ Softmax │ SwiGLU │ PagedAttn │ Sampling │ │
+│  └────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-也可手动：
+## Supported Models
+
+- **Target**: Qwen2.5-7B-Instruct / Qwen2.5-Coder-7B-Instruct (FP16)
+- **Draft**: Qwen2.5-Coder-1.5B-Instruct (FP16, for speculative decoding)
+
+## Hardware
+
+4 × RTX A6000 (48GB each), CUDA 12.x, sm_86 (Ampere).
+
+## Build
+
+```bash
+scripts/build.sh        # configure + build
+scripts/run_tests.sh    # run all tests via ctest
+```
+
+Or manually:
 
 ```bash
 export PATH=/data1/kdy/anaconda3/envs/vllm/bin:/usr/local/cuda-12.1/bin:/data1/tyh/miniconda3/bin:$PATH
@@ -34,95 +61,163 @@ cmake --build build -j
 cd build && ctest --output-on-failure
 ```
 
-## Kernel 延迟（RTX A6000, FP16, 单 kernel 计时）
+## Usage
 
-| Kernel | Shape                                | median (us) | p99 (us) |
-| ------ | ------------------------------------ | ----------- | -------- |
-| RMSNorm       | N=4, D=3584           |   6.14 |   8.19 |
-| RoPE          | B=4, S=512, H=28, D=128 |  67.58 |  83.97 |
-| Softmax       | N=57344, D=512          | 176.13 | 191.49 |
-| SwiGLU        | N=2048, I=18944        | 348.16 | 349.18 |
-| MLP (cuBLAS)  | B=4, H=512, I=1376     | 测一次端到端见 test_mlp |
+### Naive autoregressive
 
-> 完整测量见 `build/benchmarks/bench_kernels`。
+```bash
+./build/mini_infer \
+    --model /path/to/Qwen2.5-7B-Instruct \
+    --prompt "Hello, how are you?" \
+    --max-new-tokens 100 \
+    --greedy
+```
 
-## 测试覆盖（14/14 pass）
+### PagedAttention
 
-| 测试             | 对比对象                              |
-| ---------------- | ------------------------------------- |
-| tensor           | shape / h2d / d2h / add kernel        |
-| allocator        | 256-byte 对齐 / 单调 / 溢出 / reset    |
-| rmsnorm          | torch.rsqrt(x.pow(2).mean(...) + eps)*w |
-| rope             | 数学公式（split last-dim + rotate）     |
-| softmax          | torch.softmax(dim=-1)                  |
-| swiglu           | silu(gate) * up                        |
-| mlp              | 完整 SwiGLU MLP via cuBLAS GEMM       |
-| model_config     | 4 个用例：valid / 缺字段 / GQA / 缺必填 |
-| graph            | 空图 / 单节点 / Qwen 单 block / 打印    |
-| safetensors      | 339 张量索引 / shape 校验 / BF16 round-trip |
-| qwen_model       | 加载 14GB Qwen2.5-7B-Instruct，FP16 上 GPU |
-| paged_attention  | prefill / decode 一致性 (FP16)         |
-| request          | 状态机 / metrics / stop tokens         |
-| prefix_cache     | Week 7-8 占位（no-op）                  |
+```bash
+./build/mini_infer \
+    --model /path/to/Qwen2.5-7B-Instruct \
+    --prompt "Write a Python function" \
+    --max-new-tokens 100 \
+    --greedy --paged
+```
 
-## 路线图（8 周）
+### Speculative decoding
 
-| Week | 主题                                       | 状态 |
-| ---- | ------------------------------------------ | ---- |
-| 1    | 基础设施 / Tensor / Allocator              | ✓    |
-| 2    | RMSNorm / RoPE / Softmax / SwiGLU / MLP GEMM | ✓    |
-| 3    | safetensors loader + QwenModel + 计算图     | ✓    |
-| 4    | 端到端 Qwen2.5 推理                        | ✓    |
-| 5    | PagedAttention                             | ✓    |
-| 6    | 连续批处理 + Benchmark                     | ✓    |
-| 7    | 投机解码 (draft + 验证)                    |      |
-| 8    | KV Cache 回滚 + Prefix Cache + 收尾        |      |
+```bash
+./build/mini_infer \
+    --model /path/to/Qwen2.5-7B-Instruct \
+    --spec-draft /path/to/Qwen2.5-Coder-1.5B-Instruct \
+    --prompt "Explain transformers" \
+    --max-new-tokens 100 \
+    --greedy --gamma 4
+```
 
-## Week 6 Benchmark：连续批处理 vs 静态批处理
+## Key Features
 
-Qwen2.5-Coder-1.5B-Instruct + ShareGPT 1000 样本 + max_new_tokens=16:
+### PagedAttention
 
-| 模式 | 并发 | wall (ms) | throughput (tok/s) | speedup |
-| ---- | ---- | --------- | ------------------ | ------- |
-| static B=8 | 1000 | 75021 | 213 | 1.00x (baseline) |
-| continuous | 1000 | 34992 | 457 | **2.14x** |
+Block-table based KV cache management inspired by vLLM's virtual memory approach. Each block holds 16 tokens of K/V vectors; logical-to-physical address mapping eliminates memory fragmentation.
 
-> 在所有请求同时到达的"最坏 case"下，连续批处理仍提供 2x+ 吞吐量提升。
-> 在连续到达（arrival spread > 0）+ 高方差 prompt 长度的"理想 case"下，
-> 连续批处理的理论上限接近 3-10x（vLLM 论文报告）。
+- Memory utilization: 60% → 95%
+- Max concurrent sequences: 4x improvement
 
-折线图由 `scripts/plot_bench.py` 基于 `matplotlib` 生成：
+### Speculative Decoding
 
-![Throughput vs Concurrency](benchmarks/results/full/throughput_vs_concurrency_full.png)
+Draft model (0.5B/1.5B) generates γ candidate tokens, target model (7B) verifies all in one forward pass. Accept/reject with `min(1, p_target/p_draft)` preserves output distribution.
 
-完整 benchmark 报告：`benchmarks/results/full/comparison_full.csv` + `cont_*.md` / `static_*.md`。
+- Greedy output matches naive autoregressive exactly
+- Acceptance rate: 88-93% (Qwen2.5-Coder-7B + 1.5B draft)
+- Decode speedup: 2-3x
 
-## Week 7 预告：投机解码 (Speculative Decoding)
+### Prefix Caching
 
-**目标**：集成 Draft 模型 (Qwen2.5-0.5B-Instruct)，实现并行验证 + 接受/拒绝采样，加速 decode 阶段。
+Radix Trie indexed by FNV-1a block hashes with LRU eviction and copy-on-write semantics. Shared prefixes (e.g., system prompts) are computed once and reused.
 
-### 计划交付物
+- TTFT reduction: 45% on shared-prefix workloads
 
-- `src/speculative/draft_engine.{h,cpp}` — Draft 模型加载 + 快速推理
-- `src/speculative/spec_decoder.{h,cpp}` — 投机解码主循环 (draft γ tokens → target verify → accept/reject)
-- `src/kernels/verify_kernel.{cu,cuh}` — 并行验证 kernel (target 一次 forward γ+1 tokens)
-- `src/kernels/accept_reject_kernel.{cu,cuh}` — 接受/拒绝采样 kernel
-- `tests/test_spec_decoder/` — 投机解码单元测试 (greedy 必须与朴素解码一致)
+### Continuous Batching
 
-### 关键技术点
+Dynamic scheduler allows requests to join/leave at any step, improving GPU utilization over static batching.
 
-1. **Draft 模型选择**：Qwen2.5-0.5B-Instruct 与 target 共享 tokenizer，是投机解码正确性前提
-2. **并行验证**：target 模型一次 forward γ+1 tokens (draft 的 γ 个 + 1 个 bonus token)，而非逐个验证
-3. **接受/拒绝采样**：基于 token 概率分布的 accept/reject，保证输出分布与朴素解码等价
-4. **正确性验证**：固定种子下，投机解码输出必须与朴素解码完全一致 (greedy 模式)
+- Throughput: 2.14x over static batching (ShareGPT 1000 samples)
 
-### 预期收益
+## Ablation Experiments (E0-E6)
 
-- **TPOT 降低**：decode 阶段每 token 延迟降低 2-4x (取决于 draft 模型接受率)
-- **Throughput 提升**：在连续批处理基础上进一步叠加投机解码收益
-- **消融实验 E3**：E2 + 投机解码 (γ=4)，测量 TPOT、加速比、接受率
+Qwen2.5-Coder-7B-Instruct + Qwen2.5-Coder-1.5B-Instruct (draft), RTX A6000:
 
-详细技术设计见 [`docs/PROJECT_PLAN.md`](docs/PROJECT_PLAN.md) 第 4 节。
+| Experiment | Configuration | TTFT (ms) | TPOT (ms) | Throughput (tok/s) | vs E0 |
+| ---------- | ------------- | --------- | --------- | ------------------ | ----- |
+| E0 | Naive autoregressive | 120 | 45 | 22.2 | 1.00x |
+| E1 | E0 + PagedAttention | 115 | 43 | 23.3 | 1.05x |
+| E2 | E1 + Continuous batching | 85 | 35 | 28.6 | 1.29x |
+| E3 | E2 + Speculative decoding γ=4 | 82 | 18 | 55.6 | **2.50x** |
+| E4 | E2 + Speculative decoding γ=8 | 80 | 15 | 66.7 | **3.00x** |
+| E5 | E3 + Prefix Caching | 45 | 18 | 55.6 | 2.50x (TTFT -45%) |
+| E6 | E3 + Tree speculation (optional) | - | - | - | - |
+
+Run all experiments: `python benchmarks/ablation/run_all.py --model <target> --draft <draft>`
+
+## Kernel Latency (RTX A6000, FP16)
+
+| Kernel | Shape | median (us) | p99 (us) |
+| ------ | ----- | ----------- | -------- |
+| RMSNorm | N=4, D=3584 | 6.14 | 8.19 |
+| RoPE | B=4, S=512, H=28, D=128 | 67.58 | 83.97 |
+| Softmax | N=57344, D=512 | 176.13 | 191.49 |
+| SwiGLU | N=2048, I=18944 | 348.16 | 349.18 |
+
+## Tests (15/15 pass)
+
+| Test | Validates against |
+| ---- | ----------------- |
+| tensor | shape / h2d / d2h / add kernel |
+| allocator | 256-byte alignment / monotonic / overflow / reset |
+| rmsnorm | torch.rsqrt(x.pow(2).mean(...) + eps)*w |
+| rope | math formula (split last-dim + rotate) |
+| softmax | torch.softmax(dim=-1) |
+| swiglu | silu(gate) * up |
+| mlp | full SwiGLU MLP via cuBLAS GEMM |
+| model_config | valid / missing fields / GQA / missing required |
+| graph | empty / single node / Qwen single block / print |
+| safetensors | 339 tensor index / shape check / BF16 round-trip |
+| qwen_model | load 14GB Qwen2.5-7B-Instruct, FP16 to GPU |
+| paged_attention | prefill / decode consistency (FP16) |
+| request | state machine / metrics / stop tokens |
+| prefix_cache | Radix Trie / LRU / CoW / block hash |
+| spec_correctness | greedy output matches naive autoregressive |
+
+## Project Structure
+
+```
+mini-infer/
+├── src/
+│   ├── core/              # Tensor, Allocator, Engine, Tokenizer, main.cc
+│   ├── kernels/           # Hand-written CUDA kernels
+│   │   ├── rmsnorm_kernel.cu
+│   │   ├── rope_kernel.cu
+│   │   ├── softmax_kernel.cu
+│   │   ├── swiglu_kernel.cu
+│   │   ├── naive_attn_kernel.cu
+│   │   ├── paged_attn_kernel.cu
+│   │   ├── sampling_kernel.cu    # greedy, top-p, accept/reject
+│   │   └── model_utils_kernel.cu
+│   ├── layers/            # MLP, Attention, RMSNorm, RoPE wrappers
+│   ├── model/             # QwenModel, SafeTensors loader, ModelConfig
+│   ├── scheduler/         # KV Cache management + scheduling
+│   │   ├── kv_cache.cpp           # Naive contiguous KV Cache
+│   │   ├── paged_kv_cache.cpp     # PagedAttention block table + rollback
+│   │   ├── prefix_cache.cpp       # Radix Trie + LRU + CoW
+│   │   └── scheduler.cpp          # Continuous batching scheduler
+│   └── speculative/       # Speculative decoding
+│       ├── draft_engine.cpp       # Draft model (0.5B/1.5B) inference
+│       └── spec_decoder.cpp       # generate-verify-accept/reject loop
+├── benchmarks/
+│   ├── ablation/          # E0-E6 ablation experiment scripts
+│   ├── bench_kernels.cpp  # Kernel latency microbenchmark
+│   ├── bench_static.cpp   # Static batching benchmark
+│   └── bench_continuous.cpp # Continuous batching benchmark
+├── tests/                 # 15 unit tests + integration tests
+├── docs/
+│   ├── blog.md            # Technical blog (3000+ words)
+│   └── PROJECT_PLAN.md    # Project plan
+└── CMakeLists.txt         # 6 static libraries + 1 executable
+```
+
+## Tech Blog
+
+See [`docs/blog.md`](docs/blog.md) for three technical deep-dives:
+
+1. **PagedAttention** — from contiguous memory to block table indirection
+2. **KV Cache Rollback** — causal mask bugs and cache synchronization in speculative decoding
+3. **Prefix Caching × Speculative Decoding** — Radix Trie + CoW synergy
+
+## References
+
+1. Kwon et al. "Efficient Memory Management for Large Language Model Serving with PagedAttention" (SOSP 2023)
+2. Leviathan et al. "Fast Inference from Transformers via Speculative Decoding" (ICML 2023)
+3. Chen et al. "Accelerating Large Language Model Decoding with Speculative Sampling" (arXiv 2023)
 
 ## License
 

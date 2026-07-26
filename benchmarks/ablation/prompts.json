@@ -1,0 +1,12 @@
+[
+  "Hello, how are you?",
+  "Write a Python function to calculate fibonacci numbers.",
+  "Explain the concept of attention in transformers.",
+  "What are the benefits of speculative decoding?",
+  "Describe the PagedAttention algorithm.",
+  "How does KV cache management work in LLM inference?",
+  "What is the difference between greedy and sampling decoding?",
+  "Explain the transformer architecture.",
+  "What is self-attention and how does it work?",
+  "Describe the process of tokenization in NLP."
+]
