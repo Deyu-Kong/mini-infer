@@ -60,3 +60,4 @@ data/
 conc_test
 frag_test
 benchmarks/results/
+tests/bench_batched/bench_batched
