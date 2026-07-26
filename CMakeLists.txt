@@ -60,6 +60,9 @@ add_library(mini_infer_core STATIC
     src/core/allocator.cpp
     src/core/graph.cpp
     src/model/model_config.cpp
+    src/scheduler/paged_kv_cache.cpp
+    src/scheduler/prefix_cache.cpp
+    src/scheduler/request.cpp
 )
 target_include_directories(mini_infer_core
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -98,6 +101,10 @@ add_library(mini_infer_kernels STATIC
     src/kernels/rope_kernel.cu
     src/kernels/softmax_kernel.cu
     src/kernels/swiglu_kernel.cu
+    src/kernels/naive_attn_kernel.cu
+    src/kernels/sampling_kernel.cu
+    src/kernels/model_utils_kernel.cu
+    src/kernels/paged_attn_kernel.cu
 )
 target_include_directories(mini_infer_kernels
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -117,6 +124,7 @@ add_library(mini_infer_layers STATIC
     src/layers/mlp.cpp
     src/layers/rmsnorm.cpp
     src/layers/rope.cpp
+    src/layers/attention.cpp
 )
 target_include_directories(mini_infer_layers
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -147,6 +155,31 @@ target_link_libraries(mini_infer_model
             ${CUBLAS_LIB}
             m
 )
+
+# -----------------------------------------------------------------------------
+# mini_infer_engine library: Engine, Tokenizer, KVCache
+# -----------------------------------------------------------------------------
+add_library(mini_infer_engine STATIC
+    src/core/engine.cpp
+    src/core/tokenizer.cpp
+    src/scheduler/kv_cache.cpp
+    src/scheduler/scheduler.cpp
+)
+target_include_directories(mini_infer_engine
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(mini_infer_engine
+    PUBLIC  mini_infer_model
+            mini_infer_kernels
+)
+mi_force_cuda(mini_infer_engine src/core/engine.cpp src/scheduler/scheduler.cpp)
+
+# -----------------------------------------------------------------------------
+# mini_infer executable: CLI entry point
+# -----------------------------------------------------------------------------
+add_executable(mini_infer src/core/main.cc)
+target_link_libraries(mini_infer PRIVATE mini_infer_engine)
+set_source_files_properties(src/core/main.cc PROPERTIES LANGUAGE CUDA)
 
 # -----------------------------------------------------------------------------
 # Examples

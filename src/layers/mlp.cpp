@@ -5,12 +5,55 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
 #include "kernels/swiglu_kernel.cuh"
 
 namespace mini_infer {
+
+// Debug helper: print tensor statistics
+static void debug_print_tensor(const char* name, const Tensor& t, int max_elements = 10) {
+    if (t.dtype() != DType::FP16) {
+        std::printf("[DEBUG] %s: not FP16, skipping\n", name);
+        return;
+    }
+    
+    // Copy to CPU
+    Tensor cpu_t = t.to(Device::cpu());
+    const __half* data = static_cast<const __half*>(cpu_t.data());
+    int64_t numel = cpu_t.numel();
+    
+    // Compute mean and std
+    double sum = 0.0, sum_sq = 0.0;
+    for (int64_t i = 0; i < numel; ++i) {
+        float val = __half2float(data[i]);
+        sum += val;
+        sum_sq += val * val;
+    }
+    double mean = sum / numel;
+    double variance = (sum_sq / numel) - (mean * mean);
+    double std = std::sqrt(variance);
+    
+    std::printf("[DEBUG] %s: shape=[", name);
+    for (size_t i = 0; i < t.shape().size(); ++i) {
+        if (i > 0) std::printf(",");
+        std::printf("%ld", t.shape()[i]);
+    }
+    std::printf("], mean=%.6f, std=%.6f", mean, std);
+    
+    // Print first few elements
+    if (max_elements > 0 && numel > 0) {
+        std::printf(", first_%ld=[", std::min((int64_t)max_elements, numel));
+        for (int64_t i = 0; i < std::min((int64_t)max_elements, numel); ++i) {
+            if (i > 0) std::printf(",");
+            std::printf("%.6f", __half2float(data[i]));
+        }
+        std::printf("]");
+    }
+    std::printf("\n");
+}
 
 namespace {
 inline cublasHandle_t get_cublas(void* h) {
@@ -145,12 +188,7 @@ void MLP::init(int64_t hidden, int64_t intermediate, int device_index) {
     hidden_ = hidden;
     intermediate_ = intermediate;
     device_index_ = device_index;
-    w_gate_ = Tensor::empty({intermediate, hidden}, DType::FP16,
-                             Device::cuda(device_index));
-    w_up_   = Tensor::empty({intermediate, hidden}, DType::FP16,
-                             Device::cuda(device_index));
-    w_down_ = Tensor::empty({hidden, intermediate}, DType::FP16,
-                             Device::cuda(device_index));
+    // Don't allocate weights here - they will be set by set_weights()
     MI_CHECK_CUDA(cudaSetDevice(device_index));
     cublasStatus_t s = cublasCreate(reinterpret_cast<cublasHandle_t*>(&cublas_handle_));
     if (s != CUBLAS_STATUS_SUCCESS) {
@@ -161,11 +199,15 @@ void MLP::init(int64_t hidden, int64_t intermediate, int device_index) {
 }
 
 void MLP::set_weights(const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down) {
+    std::fprintf(stderr, "MLP::set_weights called with intermediate_=%ld, hidden_=%ld\n",
+                 intermediate_, hidden_);
     auto need = [&](const Tensor& t, const std::vector<int64_t>& sh) {
         if (t.dtype() != DType::FP16) {
             throw std::runtime_error("MLP weights must be FP16");
         }
         if (t.shape() != sh) {
+            std::fprintf(stderr, "Shape mismatch: got [%ld,%ld] expected [%ld,%ld]\n",
+                         t.shape()[0], t.shape()[1], sh[0], sh[1]);
             throw std::runtime_error("MLP weight shape mismatch");
         }
     };
@@ -229,6 +271,19 @@ Tensor MLP::forward(const Tensor& x) {
         static_cast<__half*>(silu_buf_.data()),
         static_cast<int>(B * intermediate_),
         /*stream=*/0);
+    
+    // Debug: print gate, up, and silu buffers
+    static int mlp_call_count = 0;
+    if (mlp_call_count == 0 || mlp_call_count == 3) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "mlp_layer%d_gate", mlp_call_count);
+        // debug_print_tensor(buf, gate_buf_);
+        snprintf(buf, sizeof(buf), "mlp_layer%d_up", mlp_call_count);
+        // debug_print_tensor(buf, up_buf_);
+        snprintf(buf, sizeof(buf), "mlp_layer%d_silu", mlp_call_count);
+        // debug_print_tensor(buf, silu_buf_);
+    }
+    mlp_call_count++;
 
     // down = silu_buf @ W_down^T  (M=B, N=H, K=I)
     gemm_rowmajor_f16(handle,

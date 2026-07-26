@@ -8,6 +8,7 @@
  */
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cstdio>
 
 namespace mini_infer {
 namespace kernels {
@@ -20,7 +21,7 @@ __global__ void swiglu_kernel(const __half* __restrict__ gate,
     if (idx >= n) return;
     float g = __half2float(gate[idx]);
     float u = __half2float(up[idx]);
-    float silu = g / (1.0f + __expf(-g));
+    float silu = g / (1.0f + expf(-g));
     out[idx] = __float2half(silu * u);
 }
 

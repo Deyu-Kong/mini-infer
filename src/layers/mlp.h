@@ -44,9 +44,9 @@ public:
     int device_index()     const { return device_index_; }
 
 private:
-    int64_t hidden_;
-    int64_t intermediate_;
-    int device_index_;
+    int64_t hidden_       = 0;
+    int64_t intermediate_ = 0;
+    int     device_index_ = 0;
 
     Tensor w_gate_;   // [I, H] FP16
     Tensor w_up_;     // [I, H] FP16

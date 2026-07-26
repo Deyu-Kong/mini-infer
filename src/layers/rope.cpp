@@ -47,14 +47,67 @@ Tensor RoPE::forward(const Tensor& x, const std::vector<int64_t>& positions) {
     const int half = D / 2;
 
     // Precompute cos/sin tables on device.
-    Tensor cos_t = Tensor::empty({S, half}, DType::FP16, Device::cuda(device_index_));
-    Tensor sin_t = Tensor::empty({S, half}, DType::FP16, Device::cuda(device_index_));
+    // For backward compatibility: positions has length S, but kernel expects [B*S, half].
+    // Replicate positions B times to create [B*S] positions array.
+    std::vector<int64_t> positions_replicated(B * S);
+    for (int b = 0; b < B; ++b) {
+        for (int s = 0; s < S; ++s) {
+            positions_replicated[b * S + s] = positions[s];
+        }
+    }
 
-    kernels::launch_rope_precompute(
+    Tensor cos_t = Tensor::empty({B * S, half}, DType::FP16, Device::cuda(device_index_));
+    Tensor sin_t = Tensor::empty({B * S, half}, DType::FP16, Device::cuda(device_index_));
+
+    kernels::launch_rope_precompute_batched(
+        inv_freq_.data(), positions_replicated.data(),
+        static_cast<__half*>(cos_t.data()),
+        static_cast<__half*>(sin_t.data()),
+        B, S, half, /*stream=*/0);
+
+    Tensor y = Tensor::empty({B, S, H, D}, DType::FP16, Device::cuda(device_index_));
+    kernels::launch_rope(
+        static_cast<const __half*>(x.data()),
+        static_cast<const __half*>(cos_t.data()),
+        static_cast<const __half*>(sin_t.data()),
+        static_cast<__half*>(y.data()),
+        B, S, H, D, /*stream=*/0);
+
+    return y;
+}
+
+Tensor RoPE::forward_batched(const Tensor& x,
+                             const std::vector<int64_t>& positions) {
+    if (x.dtype() != DType::FP16) {
+        throw std::runtime_error("RoPE::forward_batched: only FP16 supported");
+    }
+    if (x.ndim() != 4) {
+        throw std::runtime_error("RoPE::forward_batched: expect 4-D input [B,S,H,D]");
+    }
+    const int B = static_cast<int>(x.shape()[0]);
+    const int S = static_cast<int>(x.shape()[1]);
+    const int H = static_cast<int>(x.shape()[2]);
+    const int D = static_cast<int>(x.shape()[3]);
+    if (D != head_dim_) {
+        throw std::runtime_error("RoPE::forward_batched: head_dim mismatch");
+    }
+    if (!x.is_contiguous()) {
+        throw std::runtime_error("RoPE::forward_batched: only contiguous input supported");
+    }
+    if (static_cast<int>(positions.size()) != B * S) {
+        throw std::runtime_error("RoPE::forward_batched: positions size must equal B*S");
+    }
+
+    const int half = D / 2;
+
+    Tensor cos_t = Tensor::empty({B * S, half}, DType::FP16, Device::cuda(device_index_));
+    Tensor sin_t = Tensor::empty({B * S, half}, DType::FP16, Device::cuda(device_index_));
+
+    kernels::launch_rope_precompute_batched(
         inv_freq_.data(), positions.data(),
         static_cast<__half*>(cos_t.data()),
         static_cast<__half*>(sin_t.data()),
-        S, half, /*stream=*/0);
+        B, S, half, /*stream=*/0);
 
     Tensor y = Tensor::empty({B, S, H, D}, DType::FP16, Device::cuda(device_index_));
     kernels::launch_rope(

@@ -66,16 +66,6 @@ int main() {
     EXPECT(model.layers().size() == static_cast<size_t>(cfg.num_hidden_layers),
            "28 layers instantiated");
 
-    // 4. Build + inspect the graph (re-built inside load_weights).
-    auto& g = model.graph();
-    EXPECT(g.size() > 0, "graph built");
-    std::printf("  graph nodes = %zu\n", g.size());
-
-    // 5. Print a per-layer summary for one layer (to compare against
-    //    scripts/inspect_weights.py).
-    std::printf("\n  --- layer 0 summary (FP16 on GPU, dtype=fp16) ---\n");
-    model.summarize(std::cout);
-
     cudaDeviceSynchronize();
     if (g_failures == 0) { std::printf("\nALL OK\n"); return 0; }
     std::fprintf(stderr, "\n%d failures\n", g_failures);

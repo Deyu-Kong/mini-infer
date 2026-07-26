@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_fp16.h>
+
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -7,6 +9,7 @@
 
 #include "core/graph.h"
 #include "core/tensor.h"
+#include "layers/attention.h"
 #include "layers/mlp.h"
 #include "layers/rmsnorm.h"
 #include "model/model_config.h"
@@ -15,27 +18,17 @@
 namespace mini_infer {
 
 /**
- * Per-layer view of Qwen2 / LLaMA attention weights.
+ * Per-layer decoder block — RMSNorm -> Attention -> +residual ->
+ *                              RMSNorm -> MLP -> +residual
  *
- *   Q = x @ W_q^T + b_q       [B, S, H_q, D]
- *   K = x @ W_k^T + b_k       [B, S, H_kv, D]   (GQA: H_kv < H_q)
- *   V = x @ W_v^T + b_v       [B, S, H_kv, D]
- *   O = attn(Q,K,V) @ W_o^T   [B, S, H_q, D]
- *
- * Storage shape in HF safetensors:
- *   W_q : [H_q,  D,  H]      W_k : [H_kv, D, H]   W_v : [H_kv, D, H]
- *   W_o : [H,    H_q, D]     b_q/k/v : [H_q*D] / [H_kv*D]
+ * All components are constructed empty; `QwenModel::load_weights` fills
+ * them from a WeightIndex. Each component owns its own device buffers.
  */
-struct AttentionWeights {
-    Tensor w_q, w_k, w_v, w_o;
-    Tensor b_q, b_k, b_v;       // Qwen2 has biases; empty for LLaMA
-};
-
 struct LayerWeights {
-    AttentionWeights attn;
-    RMSNorm          input_layernorm;    // owns its own weight tensor
+    RMSNorm          input_layernorm;
     RMSNorm          post_attn_layernorm;
-    MLP              mlp;                // owns its three weights
+    MLP              mlp;
+    Attention        attn;
 
     LayerWeights() = default;
     LayerWeights(const LayerWeights&) = delete;
@@ -47,12 +40,9 @@ struct LayerWeights {
 /**
  * QwenModel — Qwen2.5 / LLaMA-style decoder.
  *
- * Week 3: load weights into per-layer components, build the linear graph
- * (one block = RMSNorm -> Attn -> +res -> RMSNorm -> MLP -> +res, repeated
- * `num_hidden_layers` times, plus the embed / final-norm / LM head).
- *
- * The attention forward is still a placeholder (W5); MLP and RMSNorm are
- * real (W2).
+ * Loads weights from a HuggingFace safetensors index and owns the
+ * per-layer components. `forward(...)` runs a prefill or decode step and
+ * returns logits; `Engine::generate` wraps this in an autoregressive loop.
  */
 class QwenModel {
 public:
@@ -63,33 +53,69 @@ public:
     // aliases) onto the device so later code can munmap the source file.
     void load_weights(const WeightIndex& index);
 
-    // Build (or rebuild) the computation graph of one decoder block plus
-    // the embedding + final norm + lm_head. This is a pure data-structure
-    // operation — no tensor memory allocated.
-    void build_graph();
-
     const Graph& graph() const { return graph_; }
     const ModelConfig& config() const { return cfg_; }
     int device_index() const { return device_index_; }
 
-    // Lightweight accessors used by tests + later forward passes.
+    // Lightweight accessors used by tests + the engine.
     const std::vector<LayerWeights>& layers() const { return layers_; }
     const Tensor& embed_tokens() const { return embed_; }
     const Tensor& lm_head() const { return lm_head_; }
     const RMSNorm& final_norm() const { return final_norm_; }
+    //   token_ids : [B, S] int64 CUDA
+    //   positions : [S] int64 (host) — already-known positions for the tokens
+    //   k_ptrs/v_ptrs : per-layer base pointers (KVCache::k_layer_ptr etc.)
+    //   cur_len   : how many tokens are already in the cache
+    //   is_prefill: apply causal mask
+    //
+    // Returns logits: [B, S, vocab_size] FP16 CUDA. Only the last
+    // `S - cur_skip` positions' logits are "fresh"; callers usually
+    // sample from the last row.
+    Tensor forward(const Tensor& token_ids,
+                   const std::vector<int64_t>& positions,
+                   std::vector<__half*>& k_ptrs,
+                   std::vector<__half*>& v_ptrs,
+                   int64_t max_seq,
+                   int64_t cur_len, bool is_prefill);
 
-    // Print a per-tensor summary (shape, dtype, mean, std) for a sanity
-    // check against scripts/inspect_weights.py.
-    void summarize(std::ostream& os) const;
+    // Paged forward (Week 5). Same semantics as `forward` but writes K/V
+    // through the block table indirection and reads K/V via the
+    // PagedAttention kernel. `paged_kv` must already have its block
+    // table grown to include the `S` new tokens.
+    Tensor forward_paged(const Tensor& token_ids,
+                         const std::vector<int64_t>& positions,
+                         class PagedKVCache& paged_kv,
+                         int seq_id,
+                         bool is_prefill);
+
+    // Batched paged forward. Runs B sequences in parallel through the
+    // decoder; K/V scatter, paged attention, O projection all batched.
+    //
+    //   token_ids : [B, S] int64 CUDA
+    //   positions : length (B*S) flat row-major positions
+    //   paged_kv  : shared PagedKVCache
+    //   seq_ids   : vector<int> length B  -> cache index per sequence
+    //   start_pos : vector<int> length B  -> global position where the
+    //                new tokens begin for each sequence
+    //   is_prefill : apply causal mask
+    Tensor forward_paged_batched(const Tensor& token_ids,
+                                 const std::vector<int64_t>& positions,
+                                 class PagedKVCache& paged_kv,
+                                 const std::vector<int>& seq_ids,
+                                 const std::vector<int>& start_pos,
+                                 bool is_prefill);
 
 private:
     ModelConfig cfg_;
     int device_index_;
-    std::vector<LayerWeights> layers_;   // size = num_hidden_layers
-    RMSNorm final_norm_;                // model.norm.weight
-    Tensor  embed_;                     // model.embed_tokens.weight [V, H]
-    Tensor  lm_head_;                   // lm_head.weight          [V, H]
+    std::vector<LayerWeights> layers_;
+    RMSNorm final_norm_;
+    Tensor  embed_;
+    Tensor  lm_head_;
     Graph   graph_;
+
+    Tensor residual_buf_;        // [B, S, H] reused across residual adds
+    Tensor normed_buf_;          // [B, S, H]
 };
 
 }  // namespace mini_infer

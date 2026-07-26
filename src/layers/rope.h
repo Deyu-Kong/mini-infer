@@ -20,6 +20,12 @@ public:
     // Returns y [B, S, num_heads, head_dim] FP16.
     Tensor forward(const Tensor& x, const std::vector<int64_t>& positions);
 
+    // Batched variant: positions is a flat length-B*S array, where each
+    // token (b, s) has its own position. The cos/sin tables produced have
+    // shape [B*S, head_dim/2]; the RoPE kernel indexes them per-token.
+    Tensor forward_batched(const Tensor& x,
+                           const std::vector<int64_t>& positions);
+
     int head_dim() const { return head_dim_; }
     int half_dim() const { return head_dim_ / 2; }
     float theta_base() const { return theta_base_; }

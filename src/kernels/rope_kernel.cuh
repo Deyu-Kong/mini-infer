@@ -18,5 +18,14 @@ void launch_rope_precompute(const float* inv_freq_h,
                             __half* cos_d, __half* sin_d,
                             int S, int half, cudaStream_t stream);
 
+// Precompute cos / sin tables of shape [B*S, head_dim/2] on the device.
+// inv_freq (length half) and positions (length B*S, flat row-major
+// positions[b*S + s]) are host-side.
+void launch_rope_precompute_batched(const float* inv_freq_h,
+                                    const int64_t* positions_h,
+                                    __half* cos_d, __half* sin_d,
+                                    int B, int S, int half,
+                                    cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace mini_infer

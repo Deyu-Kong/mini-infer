@@ -1,14 +1,22 @@
 /**
- * test_allocator — BumpAllocator behavior checks.
+ * test_allocator — BumpAllocator + BlockAllocator behavior checks.
  *
+ *  BumpAllocator:
  *  1. allocations are 256-byte aligned
  *  2. monotonic cursor: back-to-back allocs never overlap
  *  3. reset() returns the cursor to zero (memory stays mapped)
  *  4. over-capacity allocation returns nullptr
  *  5. touch the returned pointer with a kernel launch to confirm
  *     the underlying device memory is actually usable
+ *
+ *  BlockAllocator (Week 5):
+ *  6. initial state (all free, none in use)
+ *  7. alloc/free round trip + ref count semantics
+ *  8. OOM when pool exhausted
+ *  9. K / V block storage is actually writable
  */
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +26,7 @@
 #include "core/allocator.h"
 
 using mini_infer::BumpAllocator;
+using mini_infer::BlockAllocator;
 
 #define MI_CUDA_CHECK(call)                                                   \
     do {                                                                      \
@@ -33,6 +42,11 @@ using mini_infer::BumpAllocator;
 __global__ void touch_kernel(int* p, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) p[i] = i + 1;
+}
+
+__global__ void touch_h_kernel(__half* p, int n, float v) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) p[i] = __float2half(v);
 }
 
 static int g_failures = 0;
@@ -109,6 +123,84 @@ int main() {
     EXPECT(ok != nullptr, "1000 fits in 1024");
     void* overflow = tiny.allocate(2000);
     EXPECT(overflow == nullptr, "2000 overflows");
+    std::printf("ok\n");
+
+    // ====================================================================
+    // BlockAllocator (Week 5, PagedAttention)
+    // ====================================================================
+    using mini_infer::BlockAllocator;
+    std::printf("\n[Week 5] BlockAllocator tests\n");
+    std::printf("-----------------------------\n");
+
+    constexpr int NUM_BLOCKS   = 64;
+    constexpr int NUM_LAYERS   = 2;
+    constexpr int NUM_KV_HEADS = 4;
+    constexpr int HEAD_DIM     = 16;          // small for fast tests
+    BlockAllocator ba(NUM_BLOCKS, NUM_LAYERS, NUM_KV_HEADS, HEAD_DIM, 0);
+
+    // [6] free list starts full
+    std::printf("[6] initial state ... ");
+    EXPECT(ba.num_free_blocks() == NUM_BLOCKS, "all blocks free");
+    EXPECT(ba.in_use_blocks() == 0, "none in use");
+    EXPECT(ba.num_blocks() == NUM_BLOCKS, "num_blocks");
+    std::printf("ok\n");
+
+    // [7] alloc/free round trip, ref count tracking
+    std::printf("[7] alloc/free round trip ... ");
+    int b0 = ba.alloc();
+    int b1 = ba.alloc();
+    EXPECT(b0 >= 0 && b1 >= 0 && b0 != b1, "two distinct blocks");
+    EXPECT(ba.num_free_blocks() == NUM_BLOCKS - 2, "two fewer free");
+    EXPECT(ba.ref_count(b0) == 1, "b0 ref=1");
+    EXPECT(ba.ref_count(b1) == 1, "b1 ref=1");
+    // Sharing (prefix-cache style): ref twice.
+    ba.ref(b0);
+    EXPECT(ba.ref_count(b0) == 2, "b0 ref=2 after ref");
+    ba.unref(b0);
+    EXPECT(ba.ref_count(b0) == 1, "b0 back to 1");
+    ba.free(b0);
+    EXPECT(ba.num_free_blocks() == NUM_BLOCKS - 1, "one back on free list");
+    ba.free(b1);
+    EXPECT(ba.num_free_blocks() == NUM_BLOCKS, "all free again");
+    std::printf("ok\n");
+
+    // [8] OOM when pool exhausted
+    std::printf("[8] OOM on full pool ... ");
+    std::vector<int> ids;
+    while (true) {
+        int x = ba.alloc();
+        if (x < 0) break;
+        ids.push_back(x);
+    }
+    EXPECT(static_cast<int>(ids.size()) == NUM_BLOCKS, "filled the pool");
+    EXPECT(ba.num_free_blocks() == 0, "no free left");
+    int x = ba.alloc();
+    EXPECT(x < 0, "alloc returns -1 when full");
+    for (int id : ids) ba.free(id);
+    EXPECT(ba.num_free_blocks() == NUM_BLOCKS, "refilled after free");
+    std::printf("ok\n");
+
+    // [9] block storage is writable
+    std::printf("[9] K / V block storage writable ... ");
+    int bb = ba.alloc();
+    auto* kptr = static_cast<__half*>(ba.k_block_ptr(0, bb));
+    auto* vptr = static_cast<__half*>(ba.v_block_ptr(1, bb));
+    EXPECT(kptr != nullptr, "k_ptr not null");
+    EXPECT(vptr != nullptr, "v_ptr not null");
+    EXPECT(kptr != vptr, "K and V are separate buffers");
+    constexpr int N_PER_BLOCK = NUM_KV_HEADS * BlockAllocator::kBlockSize * HEAD_DIM;
+    const int threads_needed = 256;
+    const int blocks_needed = (N_PER_BLOCK + threads_needed - 1) / threads_needed;
+    touch_h_kernel<<<blocks_needed, threads_needed>>>(kptr, N_PER_BLOCK, 0.5f);
+    MI_CUDA_CHECK(cudaGetLastError());
+    MI_CUDA_CHECK(cudaDeviceSynchronize());
+    std::vector<__half> h_k(N_PER_BLOCK);
+    MI_CUDA_CHECK(cudaMemcpy(h_k.data(), kptr, N_PER_BLOCK * sizeof(__half),
+                             cudaMemcpyDeviceToHost));
+    int bad_h = 0;
+    for (int i = 0; i < N_PER_BLOCK; ++i) if (__half2float(h_k[i]) != 0.5f) ++bad_h;
+    EXPECT(bad_h == 0, "kernel wrote K block correctly");
+    ba.free(bb);
     std::printf("ok\n");
 
     if (g_failures == 0) {
