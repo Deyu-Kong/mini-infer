@@ -221,22 +221,45 @@ void TransformerModel::load_weights(const WeightIndex& idx) {
         // MoE models use router gate + per-expert MLPs.
         if (cfg_.is_moe()) {
             // MoE: load router gate and expert weights
-            std::string moe_prefix = "model.layers." + std::to_string(i) +
-                                     ".block_sparse_moe.";
-            std::string gate_name = moe_prefix + "gate.weight";
+            // Try Mixtral-style naming first, then DeepSeek-style
+            std::string moe_prefix_mixtral = "model.layers." + std::to_string(i) +
+                                              ".block_sparse_moe.";
+            std::string moe_prefix_deepseek = "model.layers." + std::to_string(i) +
+                                               ".mlp.";
+
+            std::string gate_name;
+            if (idx.find(moe_prefix_mixtral + "gate.weight") != nullptr) {
+                gate_name = moe_prefix_mixtral + "gate.weight";
+            } else {
+                gate_name = moe_prefix_deepseek + "gate.weight";
+            }
+
             Tensor router_gate = WeightNameMapper::load_weight_as_f16(
                 idx, gate_name, device_index_);
             layers_[i].moe.set_router_gate(router_gate);
 
+            // Determine expert naming convention
+            bool use_mixtral_naming = (idx.find(moe_prefix_mixtral + "experts.0.w1.weight") != nullptr);
+
             for (int64_t e = 0; e < cfg_.num_experts; ++e) {
-                std::string expert_prefix = moe_prefix + "experts." +
-                                           std::to_string(e) + ".";
-                Tensor wg = WeightNameMapper::load_weight_as_f16(
-                    idx, expert_prefix + "w1.weight", device_index_);
-                Tensor wu = WeightNameMapper::load_weight_as_f16(
-                    idx, expert_prefix + "w3.weight", device_index_);
-                Tensor wd = WeightNameMapper::load_weight_as_f16(
-                    idx, expert_prefix + "w2.weight", device_index_);
+                std::string expert_prefix;
+                std::string w1_name, w2_name, w3_name;
+
+                if (use_mixtral_naming) {
+                    expert_prefix = moe_prefix_mixtral + "experts." + std::to_string(e) + ".";
+                    w1_name = expert_prefix + "w1.weight";
+                    w2_name = expert_prefix + "w2.weight";
+                    w3_name = expert_prefix + "w3.weight";
+                } else {
+                    expert_prefix = moe_prefix_deepseek + "experts." + std::to_string(e) + ".";
+                    w1_name = expert_prefix + "gate_proj.weight";
+                    w2_name = expert_prefix + "down_proj.weight";
+                    w3_name = expert_prefix + "up_proj.weight";
+                }
+
+                Tensor wg = WeightNameMapper::load_weight_as_f16(idx, w1_name, device_index_);
+                Tensor wu = WeightNameMapper::load_weight_as_f16(idx, w3_name, device_index_);
+                Tensor wd = WeightNameMapper::load_weight_as_f16(idx, w2_name, device_index_);
                 layers_[i].moe.set_expert_weights(e, wg, wu, wd);
             }
         } else {
