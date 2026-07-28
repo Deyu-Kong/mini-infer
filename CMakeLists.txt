@@ -101,6 +101,7 @@ add_library(mini_infer_kernels STATIC
     src/kernels/rope_kernel.cu
     src/kernels/softmax_kernel.cu
     src/kernels/swiglu_kernel.cu
+    src/kernels/gelu_kernel.cu
     src/kernels/naive_attn_kernel.cu
     src/kernels/sampling_kernel.cu
     src/kernels/model_utils_kernel.cu

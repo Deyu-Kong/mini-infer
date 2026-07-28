@@ -26,12 +26,17 @@ public:
     Tensor forward_batched(const Tensor& x,
                            const std::vector<int64_t>& positions);
 
+    // Recompute inv_freq from a new theta_base (Gemma 3 dual-band RoPE).
+    void set_theta_base(float theta_base);
+
     int head_dim() const { return head_dim_; }
     int half_dim() const { return head_dim_ / 2; }
     float theta_base() const { return theta_base_; }
     const std::vector<float>& inv_freq() const { return inv_freq_; }
 
 private:
+    void recompute_inv_freq_();
+
     int head_dim_;
     float theta_base_;
     int device_index_;

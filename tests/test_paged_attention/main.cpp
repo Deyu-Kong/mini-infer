@@ -131,7 +131,8 @@ struct NaiveCtx {
             Q_dev, K_dev, V_dev, out_dev,
             B, S_q, seq_len,
             H_q, H_kv, head_dim,
-            num_kv_groups, scale, is_prefill ? 1 : 0, /*stream=*/0);
+            num_kv_groups, scale, is_prefill ? 1 : 0,
+            /*sliding_window=*/0, /*stream=*/0);
         MI_CUDA_CHECK(cudaDeviceSynchronize());
         return to_host_fp32(out_dev, B * S_q * H_q * head_dim);
     }
@@ -159,6 +160,7 @@ struct PagedCtx {
     int* block_table_dev;        // [B, max_blocks_per_seq]
     int* num_blocks_used_dev;    // [B]
     int* seq_len_dev;            // [B]
+    int* start_pos_dev;          // [B]  global position where new tokens begin
     float scale;
     bool is_prefill;
 
@@ -178,11 +180,13 @@ struct PagedCtx {
         MI_CUDA_CHECK(cudaMalloc(&block_table_dev, max_blocks_per_seq * sizeof(int)));
         MI_CUDA_CHECK(cudaMalloc(&num_blocks_used_dev, sizeof(int)));
         MI_CUDA_CHECK(cudaMalloc(&seq_len_dev, sizeof(int)));
+        MI_CUDA_CHECK(cudaMalloc(&start_pos_dev, sizeof(int)));
     }
     ~PagedCtx() {
         cudaFree(Q_dev); cudaFree(out_dev);
         cudaFree(K_cache); cudaFree(V_cache);
         cudaFree(block_table_dev); cudaFree(num_blocks_used_dev); cudaFree(seq_len_dev);
+        cudaFree(start_pos_dev);
     }
 
     // Build K_cache / V_cache with logical [0, seq_len) in the order
@@ -233,17 +237,21 @@ struct PagedCtx {
         const int n_blocks_used = (seq_len + block_size - 1) / block_size;
         MI_CUDA_CHECK(cudaMemcpy(num_blocks_used_dev, &n_blocks_used,
                                  sizeof(int), cudaMemcpyHostToDevice));
-        MI_CUDA_CHECK(cudaMemcpy(seq_len_dev, &seq_len, sizeof(int),
-                                 cudaMemcpyHostToDevice));
+MI_CUDA_CHECK(cudaMemcpy(seq_len_dev, &seq_len, sizeof(int),
+                                  cudaMemcpyHostToDevice));
+        const int start_pos_h = is_prefill ? 0 : (seq_len - S_q);
+        MI_CUDA_CHECK(cudaMemcpy(start_pos_dev, &start_pos_h, sizeof(int),
+                                  cudaMemcpyHostToDevice));
     }
 
     std::vector<float> run_paged() {
         kn::launch_paged_attn(
             Q_dev, K_cache, V_cache,
-            block_table_dev, num_blocks_used_dev, seq_len_dev,
+            block_table_dev, num_blocks_used_dev, seq_len_dev, start_pos_dev,
             B, S_q, H_q, H_kv, head_dim,
             num_kv_groups, max_blocks_per_seq,
             /*layer=*/0, num_blocks_pool, scale, is_prefill ? 1 : 0,
+            /*sliding_window=*/0,
             out_dev, /*stream=*/0);
         MI_CUDA_CHECK(cudaDeviceSynchronize());
         return to_host_fp32(out_dev, B * S_q * H_q * head_dim);

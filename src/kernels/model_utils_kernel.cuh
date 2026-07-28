@@ -23,6 +23,12 @@ void launch_embedding_gather(const int64_t* token_ids, const __half* embed_table
 void launch_scale_inplace(__half* y, float scale, int64_t n, cudaStream_t stream);
 
 /**
+ * In-place elementwise multiply: y[i] *= x[i]  (FP16, row-major, on CUDA).
+ * Used by GeGLU after the gate is GELU-activated.
+ */
+void launch_mul_inplace(__half* y, const __half* x, int64_t n, cudaStream_t stream);
+
+/**
  * Scatter a (K or V) tensor into a paged KV cache.
  *
  * For each (b, s, kv_head, d) of the source tensor [B, S, H_kv, D], the

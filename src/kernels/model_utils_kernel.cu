@@ -78,6 +78,20 @@ void launch_scale_inplace(__half* y, float scale, int64_t n, cudaStream_t s) {
     scale_inplace_kernel<<<grid, block, 0, s>>>(y, scale, n);
 }
 
+// y[i] *= x[i]  (FP16, in-place elementwise multiply).
+__global__ void mul_inplace_kernel(__half* y, const __half* x, int64_t n) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = __float2half(__half2float(y[i]) * __half2float(x[i]));
+}
+
+void launch_mul_inplace(__half* y, const __half* x, int64_t n, cudaStream_t s) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = static_cast<int>((n + block - 1) / block);
+    mul_inplace_kernel<<<grid, block, 0, s>>>(y, x, n);
+}
+
 // ===========================================================================
 // Paged KV scatter (Week 5)
 // ===========================================================================

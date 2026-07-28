@@ -50,6 +50,14 @@ ModelArch ModelConfig::arch_from_model_type(const std::string& mt) {
     return ModelArch::QwenLLaMA;
 }
 
+ActKind ModelConfig::act_from_string(const std::string& ha) {
+    // PyTorch names. Gemma uses "gelu_pytorch_tanh".
+    if (ha == "silu" || ha == "SwiGLU") return ActKind::Silu;
+    if (ha == "gelu_pytorch_tanh" || ha == "gelu") return ActKind::GeluTanh;
+    // Unknown default to SwiGLU (matches Qwen/LLaMA/Mistral/Yi/DeepSeek).
+    return ActKind::Silu;
+}
+
 ModelConfig ModelConfig::load(const std::string& path) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("ModelConfig: cannot open " + path);
@@ -68,7 +76,12 @@ ModelConfig ModelConfig::load(const std::string& path) {
     c.rope_theta              = jget_float(j, "rope_theta", 10000.0f);
     c.max_position_embeddings = jget_int(j, "max_position_embeddings", 32768);
     c.tie_word_embeddings     = jget_bool(j, "tie_word_embeddings", false);
-    c.hidden_act              = jget_str (j, "hidden_act", "silu");
+    // Some Gemma configs use `hidden_activation` instead of `hidden_act`.
+    if (j.contains("hidden_act")) {
+        c.hidden_act = j["hidden_act"].get<std::string>();
+    } else if (j.contains("hidden_activation")) {
+        c.hidden_act = j["hidden_activation"].get<std::string>();
+    }
     c.torch_dtype             = jget_str (j, "torch_dtype", "bfloat16");
     c.model_type              = jget_str (j, "model_type", "qwen2");
     if (j.contains("architectures") && j["architectures"].is_array() &&
@@ -76,43 +89,49 @@ ModelConfig ModelConfig::load(const std::string& path) {
         c.architectures = j["architectures"][0].get<std::string>();
     }
 
+    c.mlp_act = act_from_string(c.hidden_act);
+
     // ---- arch-specific overrides --------------------------------------
     c.arch = arch_from_model_type(c.model_type);
     if (c.arch == ModelArch::Gemma) {
-        // Gemma sets `head_dim` independently. If it's present, use it.
-        // Otherwise derive (Gemma also uses hidden / num_heads but the JSON
-        // usually still lists it explicitly).
         c.head_dim_override = jget_int(j, "head_dim", 0);
-        // Gemma's (1 + weight) RMSNorm variant.
         c.rmsnorm_add_one = true;
-        // Gemma scales the embedding output by sqrt(hidden_size).
         c.embed_scale = true;
-        // Gemma has no QKV bias.
         c.has_qkv_bias = false;
-        // Gemma 1/2/3 all tie embed_tokens and lm_head by default. The
-        // config.json usually omits `tie_word_embeddings`; if it's missing
-        // for a Gemma config we assume tied.
         if (!j.contains("tie_word_embeddings")) {
             c.tie_word_embeddings = true;
         }
-
-        // Gemma defaults: rope_theta 10000 unless overridden (Gemma 3 uses
-        // 1_000_000 but the JSON will say so).
         if (c.rope_theta == 0.0f) c.rope_theta = 10000.0f;
+
+        // Gemma 2 (model_type == "gemma2") and Gemma 3 use the 4-norm
+        // double-wrapped block. Gemma 1 (model_type == "gemma") uses
+        // the LLaMA-style 2-norm block but with GeGLU.
+        c.double_norm_block = (c.model_type == "gemma2" ||
+                               c.model_type.rfind("gemma3", 0) == 0);
+
+    // Sliding window attention. Gemma 2 and 3 both use it; Gemma 1
+    // does not.
+    c.sliding_window = jget_int(j, "sliding_window", 0);
+    if (c.model_type == "gemma2") {
+        // Gemma 2: alternating pattern (even layers = sliding, odd = full)
+        c.sliding_window_pattern = 2;
+    } else if (c.model_type.rfind("gemma3", 0) == 0) {
+        c.sliding_window_pattern = jget_int(j, "sliding_window_pattern", 6);
+        c.use_qk_norm = true;
+        c.dual_rope = true;
+        c.local_rope_theta = jget_float(j, "rope_local_base_freq", 10000.0f);
+    }
     } else {
         // Qwen2 / LLaMA family.
-        // Qwen2/2.5 has q_proj.bias; LLaMA / Mistral / Yi / DeepSeek do not.
-        // We detect by architectures field: "Qwen2..." -> bias present.
         const std::string& a = c.architectures;
         if (a.rfind("Qwen", 0) == 0 || a.rfind("qwen", 0) == 0) {
             c.has_qkv_bias = true;
         } else {
             c.has_qkv_bias = false;
         }
+        // Mistral sliding window (ignored for now; we run full attention).
+        c.sliding_window = jget_int(j, "sliding_window", 0);
     }
-
-    // Mistral sliding window (ignored for now; we run full attention).
-    c.sliding_window = jget_int(j, "sliding_window", 0);
 
     // ---- validation ----------------------------------------------------
     if (c.hidden_size == 0 || c.num_hidden_layers == 0 ||

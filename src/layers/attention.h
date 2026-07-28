@@ -10,7 +10,7 @@
 namespace mini_infer {
 
 /**
- * Single-layer attention (Qwen2 / LLaMA-style).
+ * Single-layer attention (Qwen2 / LLaMA-style + Gemma variants).
  *
  * Storage layout for the projection weights matches HuggingFace safetensors:
  *   W_q : [num_heads * head_dim, hidden]
@@ -18,6 +18,8 @@ namespace mini_infer {
  *   W_v : [num_kv_heads * head_dim, hidden]
  *   W_o : [hidden, num_heads * head_dim]
  *   b_q/k/v : [num_heads * head_dim] / [num_kv_heads * head_dim]   (Qwen2 only)
+ *   W_q_norm : [head_dim]   (Gemma 3 only — RMSNorm applied to Q before RoPE)
+ *   W_k_norm : [head_dim]   (Gemma 3 only — RMSNorm applied to K before RoPE)
  *
  * Forward semantics:
  *
@@ -25,9 +27,11 @@ namespace mini_infer {
  *   K = x @ W_k^T + b_k          [B, S, H_kv*D]
  *   V = x @ W_v^T + b_v          [B, S, H_kv*D]
  *   Q,K,V <- reshape to [B,S,H,D]
+ *   Q <- Q_norm(Q)               (Gemma 3 only; requires use_qk_norm_)
+ *   K <- K_norm(K)               (Gemma 3 only)
  *   Q,K <- RoPE at positions[0..S)
  *   K,V -> appended into kv_k_cache / kv_v_cache at slot [cur_len, cur_len+S)
- *   attn = SDPA(Q, K, V, causal = is_prefill)      [B, S, H_q*D]
+ *   attn = SDPA(Q, K, V, causal = is_prefill, sliding_window = sliding_window_)
  *   out  = attn @ W_o^T                            [B, S, hidden]
  */
 class Attention {
@@ -35,7 +39,7 @@ public:
     // Default constructor creates an uninitialized Attention.
     // Must call init() before use.
     Attention() = default;
-    
+
     Attention(int64_t hidden, int64_t num_heads, int64_t num_kv_heads,
               int64_t head_dim, float rope_theta, int device_index);
     ~Attention();
@@ -44,9 +48,20 @@ public:
     void init(int64_t hidden, int64_t num_heads, int64_t num_kv_heads,
               int64_t head_dim, float rope_theta, int device_index);
 
+    // Enable Q/K RMSNorm pre-RoPE (Gemma 3).
+    void set_qk_norm(int64_t head_dim, float eps, int device_index);
+
+    // Enable sliding-window attention (Gemma 2/3). `window` is the number
+    // of tokens each query can attend back to. 0 disables.
+    void set_sliding_window(int64_t window) { sliding_window_ = window; }
+
+    // Switch RoPE inv_freq source (Gemma 3 dual-band). When set, RoPE
+    // uses `local_rope_theta` instead of the construction-time `rope_theta_`.
+    void use_local_rope(bool v) { use_local_rope_ = v; }
+
     Attention(const Attention&) = delete;
     Attention& operator=(const Attention&) = delete;
-    
+
     // Move constructor and assignment.
     Attention(Attention&& other) noexcept;
     Attention& operator=(Attention&& other) noexcept;
@@ -54,6 +69,13 @@ public:
     // Weight pointers (set after the model loader materialises them on GPU).
     void set_weights(Tensor w_q, Tensor w_k, Tensor w_v, Tensor w_o,
                      Tensor b_q, Tensor b_k, Tensor b_v);
+
+    // Q/K RMSNorm weights (Gemma 3). Optional; if numel==0 they're skipped.
+    void set_qk_norm_weights(const Tensor& w_q_norm, const Tensor& w_k_norm);
+
+    // Local vs global RoPE theta (Gemma 3 dual-band).
+    void set_local_rope_theta(float theta) { local_rope_theta_ = theta; }
+    float local_rope_theta() const { return local_rope_theta_; }
 
     // Forward pass.
     //   hidden_states : [B, S, hidden]   FP16 CUDA, contiguous
@@ -136,6 +158,20 @@ private:
     Tensor w_q_, w_k_, w_v_, w_o_;
     Tensor b_q_, b_k_, b_v_;
     bool   has_bias_ = false;
+
+    // Q/K RMSNorm (Gemma 3 only). If `use_qk_norm_` is true and the
+    // weights are loaded, we apply RMSNorm to Q and K before RoPE.
+    Tensor w_q_norm_, w_k_norm_;
+    bool   use_qk_norm_ = false;
+    float  qk_norm_eps_ = 1e-6f;
+
+    // Sliding-window attention (Gemma 2/3). 0 means full attention.
+    int64_t sliding_window_ = 0;
+
+    // Local vs global RoPE (Gemma 3). When true, RoPE uses
+    // local_rope_theta_ instead of rope_theta_ for inv_freq.
+    bool   use_local_rope_ = false;
+    float  local_rope_theta_ = 10000.0f;
 
     // Persistent buffers (allocated lazily based on B*S).
     Tensor q_buf_, k_buf_, v_buf_;     // [B, S, H_*D]  per-step projections

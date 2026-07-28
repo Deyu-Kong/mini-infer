@@ -130,13 +130,37 @@ QwenModel::QwenModel(const ModelConfig& cfg, int device_index)
                                          device_index, cfg.rmsnorm_add_one);
         lw.post_attn_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
                                          device_index, cfg.rmsnorm_add_one);
-        lw.mlp.init(cfg.hidden_size, cfg.intermediate_size, device_index);
+        // Gemma 2/3 only — pre/post_feedforward_layernorm. They are
+        // populated by load_weights when present in the checkpoint; the
+        // forward path uses them only when arch == Gemma && double_norm_block.
+        lw.pre_feedforward_layernorm  = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                                device_index, cfg.rmsnorm_add_one);
+        lw.post_feedforward_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                                device_index, cfg.rmsnorm_add_one);
+        lw.mlp.init(cfg.hidden_size, cfg.intermediate_size, device_index,
+                    cfg.mlp_act);
         lw.attn.init(cfg.hidden_size,
                      cfg.num_attention_heads,
                      cfg.num_key_value_heads,
                      cfg.head_dim(),
                      cfg.rope_theta,
                      device_index);
+
+        // Gemma 3: enable Q/K RMSNorm per layer.
+        if (cfg.use_qk_norm) {
+            lw.attn.set_qk_norm(cfg.head_dim(), cfg.rms_norm_eps, device_index);
+        }
+        // Gemma 2/3: sliding window attention on alternating layers.
+        if (cfg.sliding_window > 0) {
+            lw.attn.set_sliding_window(cfg.sliding_window);
+            lw.is_sliding = cfg.is_layer_sliding(i);
+            // Gemma 3 dual-band RoPE: sliding layers use local theta.
+            if (cfg.dual_rope && lw.is_sliding) {
+                lw.attn.use_local_rope(true);
+                lw.attn.set_local_rope_theta(cfg.local_rope_theta);
+            }
+        }
+
         layers_.push_back(std::move(lw));
     }
     embed_   = Tensor::empty({cfg.vocab_size, cfg.hidden_size}, DType::FP16,
@@ -166,6 +190,24 @@ void QwenModel::load_weights(const WeightIndex& idx) {
             WeightNameMapper::load_weight_as_f16(idx, n.post_attn_layernorm,
                                                  device_index_));
 
+        // Gemma 2/3: extra pre/post_feedforward_layernorm. They are only
+        // present in Gemma 2/3 safetensors; the forward path consults
+        // cfg_.double_norm_block before applying them.
+        if (cfg_.double_norm_block) {
+            if (!n.pre_feedforward_layernorm.empty() &&
+                idx.find(n.pre_feedforward_layernorm) != nullptr) {
+                layers_[i].pre_feedforward_layernorm.set_weight(
+                    WeightNameMapper::load_weight_as_f16(
+                        idx, n.pre_feedforward_layernorm, device_index_));
+            }
+            if (!n.post_feedforward_layernorm.empty() &&
+                idx.find(n.post_feedforward_layernorm) != nullptr) {
+                layers_[i].post_feedforward_layernorm.set_weight(
+                    WeightNameMapper::load_weight_as_f16(
+                        idx, n.post_feedforward_layernorm, device_index_));
+            }
+        }
+
         // MLP: same shape for both archs, but we go through the mapper for
         // the names so future per-arch renames land in one place.
         Tensor wg = WeightNameMapper::load_weight_as_f16(idx, n.gate_proj,
@@ -174,13 +216,6 @@ void QwenModel::load_weights(const WeightIndex& idx) {
                                                          device_index_);
         Tensor wd = WeightNameMapper::load_weight_as_f16(idx, n.down_proj,
                                                          device_index_);
-
-        std::fprintf(stderr,
-                     "Layer %ld MLP shapes: wg=[%ld,%ld] wu=[%ld,%ld] wd=[%ld,%ld] expected=[%ld,%ld]\n",
-                     i, wg.shape()[0], wg.shape()[1],
-                        wu.shape()[0], wu.shape()[1],
-                        wd.shape()[0], wd.shape()[1],
-                     cfg_.intermediate_size, cfg_.hidden_size);
 
         layers_[i].mlp.set_weights(wg, wu, wd);
 
@@ -219,6 +254,18 @@ void QwenModel::load_weights(const WeightIndex& idx) {
 
         layers_[i].attn.set_weights(qkv.w_q, qkv.w_k, qkv.w_v,
                                     wo, bq, bk, bv);
+
+        // Gemma 3: Q/K RMSNorm pre-RoPE.
+        if (cfg_.use_qk_norm) {
+            if (!n.q_norm.empty() && !n.k_norm.empty() &&
+                idx.find(n.q_norm) != nullptr && idx.find(n.k_norm) != nullptr) {
+                Tensor wqn = WeightNameMapper::load_weight_as_f16(idx, n.q_norm,
+                                                                  device_index_);
+                Tensor wkn = WeightNameMapper::load_weight_as_f16(idx, n.k_norm,
+                                                                  device_index_);
+                layers_[i].attn.set_qk_norm_weights(wqn, wkn);
+            }
+        }
     }
 
     embed_ = WeightNameMapper::load_weight_as_f16(idx, mapper.embed_tokens(),
@@ -284,16 +331,12 @@ Tensor QwenModel::forward(const Tensor& token_ids,
         // ---- attention block -----------------------------------------
         // Reshape hidden from [B, S, H] to [B*S, H] for RMSNorm
         Tensor hidden_2d({B * S, H}, DType::FP16, Device::cuda(device_index_));
-        cudaMemcpy(hidden_2d.data(), hidden.data(), 
+        cudaMemcpy(hidden_2d.data(), hidden.data(),
                    static_cast<int64_t>(B) * S * H * sizeof(__half),
                    cudaMemcpyDeviceToDevice);
-        
+
         Tensor normed_2d = layers_[i].input_layernorm.forward(hidden_2d);
-        
-        if (i == 0) {
-            // debug_print_tensor("after_input_layernorm_layer0", normed_2d);
-        }
-        
+
         // Reshape back to [B, S, H]
         normed_buf_ = Tensor({B, S, H}, DType::FP16, Device::cuda(device_index_));
         cudaMemcpy(normed_buf_.data(), normed_2d.data(),
@@ -303,58 +346,58 @@ Tensor QwenModel::forward(const Tensor& token_ids,
         Tensor attn_out = layers_[i].attn.forward(normed_buf_, positions,
                                                   k_ptrs[i], v_ptrs[i],
                                                   max_seq, cur_len, is_prefill);
-        
-        if (i == 0 || i == 3) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "after_attention_layer%zu", i);
-            // debug_print_tensor(buf, attn_out);
+
+        // Gemma 2/3 double-norm wrapping: post_attention_layernorm wraps
+        // the attn output before the residual add.
+        if (cfg_.double_norm_block) {
+            Tensor attn_out_2d({B * S, H}, DType::FP16, Device::cuda(device_index_));
+            cudaMemcpy(attn_out_2d.data(), attn_out.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            Tensor attn_out_normed_2d = layers_[i].post_attn_layernorm.forward(attn_out_2d);
+            Tensor attn_out_normed({B, S, H}, DType::FP16,
+                                   Device::cuda(device_index_));
+            cudaMemcpy(attn_out_normed.data(), attn_out_normed_2d.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            attn_out = attn_out_normed;
         }
 
         // residual: hidden += attn_out
         kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
                            static_cast<const __half*>(attn_out.data()),
                            static_cast<int64_t>(B) * S * H, /*stream=*/0);
-        
-        if (i == 0) {
-            // debug_print_tensor("after_residual1_layer0", hidden);
-        }
 
-        // ---- post-attention norm + MLP ------------------------------
-        // Reshape hidden from [B, S, H] to [B*S, H] for RMSNorm
-        cudaMemcpy(hidden_2d.data(), hidden.data(),
-                   static_cast<int64_t>(B) * S * H * sizeof(__half),
-                   cudaMemcpyDeviceToDevice);
-        
-        normed_2d = layers_[i].post_attn_layernorm.forward(hidden_2d);
-        
-        if (i == 0 || i == 3) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "after_post_attn_layernorm_layer%zu", i);
-            // debug_print_tensor(buf, normed_2d);
-        }
-        
-        // MLP expects [B*S, H] input, which is what we have in normed_2d
-        Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d);
-        
-        if (i == 0 || i == 3) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "after_mlp_layer%zu", i);
-            // debug_print_tensor(buf, mlp_out_2d);
-        }
-        
-        // Reshape back to [B, S, H] and add residual
-        kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
-                           static_cast<const __half*>(mlp_out_2d.data()),
-                           static_cast<int64_t>(B) * S * H, /*stream=*/0);
-        
-        if (i == 0 || i == 3 || i == 6 || i == 7 || i == 8 || i == 9 || i == 10 || i == 15 || i == 20 || i == 27) {
-            char buf[64];
-            snprintf(buf, sizeof(buf), "after_residual2_layer%zu", i);
-            // debug_print_tensor(buf, hidden);
-        }
-        
-        if (i == 27) {
-            // debug_print_tensor("after_residual2_layer27", hidden);
+        // ---- MLP block ------------------------------------------------
+        // For LLaMA / Qwen / Gemma 1: post_attention_layernorm goes before
+        //   the MLP (and the residual is applied after the MLP).
+        // For Gemma 2/3: pre_feedforward_layernorm wraps the MLP input;
+        //   post_feedforward_layernorm wraps the MLP output, then residual.
+        if (cfg_.double_norm_block) {
+            cudaMemcpy(hidden_2d.data(), hidden.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            Tensor pre_normed_2d = layers_[i].pre_feedforward_layernorm.forward(hidden_2d);
+            Tensor mlp_out_2d = layers_[i].mlp.forward(pre_normed_2d);
+            Tensor mlp_out_normed_2d = layers_[i].post_feedforward_layernorm.forward(mlp_out_2d);
+            Tensor mlp_out_normed({B, S, H}, DType::FP16,
+                                  Device::cuda(device_index_));
+            cudaMemcpy(mlp_out_normed.data(), mlp_out_normed_2d.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
+                static_cast<const __half*>(mlp_out_normed.data()),
+                static_cast<int64_t>(B) * S * H, /*stream=*/0);
+        } else {
+            // Standard 2-norm block: hidden -> post_attn_norm -> MLP -> residual
+            cudaMemcpy(hidden_2d.data(), hidden.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            Tensor normed_2d_mlp = layers_[i].post_attn_layernorm.forward(hidden_2d);
+            Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d_mlp);
+            kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
+                static_cast<const __half*>(mlp_out_2d.data()),
+                static_cast<int64_t>(B) * S * H, /*stream=*/0);
         }
     }
 
@@ -463,19 +506,49 @@ Tensor QwenModel::forward_paged_batched(const Tensor& token_ids,
             normed_buf_, positions, paged_kv, seq_ids, start_pos,
             static_cast<int>(i), is_prefill);
 
+        if (cfg_.double_norm_block) {
+            Tensor attn_out_2d({B * S, H}, DType::FP16, Device::cuda(device_index_));
+            cudaMemcpy(attn_out_2d.data(), attn_out.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            Tensor attn_out_normed_2d = layers_[i].post_attn_layernorm.forward(attn_out_2d);
+            Tensor attn_out_normed({B, S, H}, DType::FP16,
+                                   Device::cuda(device_index_));
+            cudaMemcpy(attn_out_normed.data(), attn_out_normed_2d.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            attn_out = attn_out_normed;
+        }
+
         kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
             static_cast<const __half*>(attn_out.data()),
             static_cast<int64_t>(B) * S * H, /*stream=*/0);
 
-        cudaMemcpy(hidden_2d.data(), hidden.data(),
-                   static_cast<int64_t>(B) * S * H * sizeof(__half),
-                   cudaMemcpyDeviceToDevice);
-        normed_2d = layers_[i].post_attn_layernorm.forward(hidden_2d);
-        Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d);
-
-        kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
-            static_cast<const __half*>(mlp_out_2d.data()),
-            static_cast<int64_t>(B) * S * H, /*stream=*/0);
+        if (cfg_.double_norm_block) {
+            cudaMemcpy(hidden_2d.data(), hidden.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            Tensor pre_normed_2d = layers_[i].pre_feedforward_layernorm.forward(hidden_2d);
+            Tensor mlp_out_2d = layers_[i].mlp.forward(pre_normed_2d);
+            Tensor mlp_out_normed_2d = layers_[i].post_feedforward_layernorm.forward(mlp_out_2d);
+            Tensor mlp_out_normed({B, S, H}, DType::FP16,
+                                  Device::cuda(device_index_));
+            cudaMemcpy(mlp_out_normed.data(), mlp_out_normed_2d.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
+                static_cast<const __half*>(mlp_out_normed.data()),
+                static_cast<int64_t>(B) * S * H, /*stream=*/0);
+        } else {
+            cudaMemcpy(hidden_2d.data(), hidden.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            normed_2d = layers_[i].post_attn_layernorm.forward(hidden_2d);
+            Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d);
+            kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
+                static_cast<const __half*>(mlp_out_2d.data()),
+                static_cast<int64_t>(B) * S * H, /*stream=*/0);
+        }
     }
 
     // Final RMSNorm.
@@ -567,21 +640,50 @@ Tensor QwenModel::forward_paged(const Tensor& token_ids,
             normed_buf_, positions, paged_kv, seq_id,
             static_cast<int>(i), is_prefill);
 
+        if (cfg_.double_norm_block) {
+            Tensor attn_out_2d({B * S, H}, DType::FP16, Device::cuda(device_index_));
+            cudaMemcpy(attn_out_2d.data(), attn_out.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            Tensor attn_out_normed_2d = layers_[i].post_attn_layernorm.forward(attn_out_2d);
+            Tensor attn_out_normed({B, S, H}, DType::FP16,
+                                   Device::cuda(device_index_));
+            cudaMemcpy(attn_out_normed.data(), attn_out_normed_2d.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            attn_out = attn_out_normed;
+        }
+
         kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
             static_cast<const __half*>(attn_out.data()),
             static_cast<int64_t>(B) * S * H, /*stream=*/0);
 
-        // ---- post-attention norm + MLP -------------------------------
-        cudaMemcpy(hidden_2d.data(), hidden.data(),
-                   static_cast<int64_t>(B) * S * H * sizeof(__half),
-                   cudaMemcpyDeviceToDevice);
-        normed_2d = layers_[i].post_attn_layernorm.forward(hidden_2d);
-
-        Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d);
-
-        kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
-            static_cast<const __half*>(mlp_out_2d.data()),
-            static_cast<int64_t>(B) * S * H, /*stream=*/0);
+        if (cfg_.double_norm_block) {
+            cudaMemcpy(hidden_2d.data(), hidden.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            Tensor pre_normed_2d = layers_[i].pre_feedforward_layernorm.forward(hidden_2d);
+            Tensor mlp_out_2d = layers_[i].mlp.forward(pre_normed_2d);
+            Tensor mlp_out_normed_2d = layers_[i].post_feedforward_layernorm.forward(mlp_out_2d);
+            Tensor mlp_out_normed({B, S, H}, DType::FP16,
+                                  Device::cuda(device_index_));
+            cudaMemcpy(mlp_out_normed.data(), mlp_out_normed_2d.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
+                static_cast<const __half*>(mlp_out_normed.data()),
+                static_cast<int64_t>(B) * S * H, /*stream=*/0);
+        } else {
+            // ---- post-attention norm + MLP -------------------------------
+            cudaMemcpy(hidden_2d.data(), hidden.data(),
+                       static_cast<int64_t>(B) * S * H * sizeof(__half),
+                       cudaMemcpyDeviceToDevice);
+            normed_2d = layers_[i].post_attn_layernorm.forward(hidden_2d);
+            Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d);
+            kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
+                static_cast<const __half*>(mlp_out_2d.data()),
+                static_cast<int64_t>(B) * S * H, /*stream=*/0);
+        }
     }
 
     // Final RMSNorm + LM head.

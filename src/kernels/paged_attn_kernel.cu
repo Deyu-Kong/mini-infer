@@ -107,6 +107,7 @@ __global__ void paged_attn_kernel(
     const int*    __restrict__ block_table,   // [B, max_blocks_per_seq]
     const int*    __restrict__ num_blocks_used, // [B]
     const int*    __restrict__ seq_len,       // [B]
+    const int*    __restrict__ start_pos,     // [B]  global position where new tokens begin
     int S_q,
     int H_q,
     int H_kv,
@@ -116,6 +117,7 @@ __global__ void paged_attn_kernel(
     int num_blocks,
     float scale,
     int is_prefill,                            // 1 -> apply causal mask
+    int sliding_window,                        // 0 = disabled (Gemma 2/3)
     __half*       __restrict__ output) {      // [B, S_q, H_q, D]
     static_assert(BLOCK_THREADS == HEAD_DIM,
                   "BLOCK_THREADS must equal HEAD_DIM");
@@ -139,13 +141,16 @@ __global__ void paged_attn_kernel(
     //      them in shared memory so all threads agree) -------------------
     __shared__ int  n_blocks_smem;
     __shared__ int  seq_len_smem;
+    __shared__ int  start_pos_smem;
     if (tid == 0) {
-        n_blocks_smem = num_blocks_used[b];
-        seq_len_smem  = seq_len[b];
+        n_blocks_smem  = num_blocks_used[b];
+        seq_len_smem   = seq_len[b];
+        start_pos_smem = start_pos[b];
     }
     __syncthreads();
-    const int n_blocks = n_blocks_smem;
-    const int cur_len = seq_len_smem;
+    const int n_blocks   = n_blocks_smem;
+    const int cur_len    = seq_len_smem;
+    const int blk_start_pos = start_pos_smem;  // global position where the new tokens begin
     if (cur_len <= 0) {
         // Degenerate: empty sequence. Just zero the output.
         if (tid < D) {
@@ -176,9 +181,7 @@ __global__ void paged_attn_kernel(
 
     // The query position in the global token stream (only used for causal
     // masking during prefill).
-    const int query_global_pos = sq;  // for now we use S_q==1 for decode
-                                      // and S_q==prompt_len for prefill where
-                                      // sq == position within the prompt.
+    const int query_global_pos = blk_start_pos + sq;
 
     // ---- iterate over KV blocks ---------------------------------------
     for (int blk = 0; blk < n_blocks; ++blk) {
@@ -223,6 +226,11 @@ __global__ void paged_attn_kernel(
                 continue;
             }
             if (is_prefill && t_global > query_global_pos) {
+                if (lane == 0) scores[t_local] = -INFINITY;
+                continue;
+            }
+            if (sliding_window > 0 &&
+                t_global < query_global_pos - sliding_window + 1) {
                 if (lane == 0) scores[t_local] = -INFINITY;
                 continue;
             }
@@ -287,6 +295,7 @@ void launch_paged_attn(const __half* Q,
                        const int* block_table,
                        const int* num_blocks_used,
                        const int* seq_len,
+                       const int* start_pos,
                        int B,
                        int S_q,
                        int H_q,
@@ -298,6 +307,7 @@ void launch_paged_attn(const __half* Q,
                        int num_blocks,
                        float scale,
                        int is_prefill,
+                       int sliding_window,
                        __half* output,
                        cudaStream_t stream) {
     if (head_dim != 128 && head_dim != 64) {
@@ -307,15 +317,15 @@ void launch_paged_attn(const __half* Q,
     if (head_dim == 128) {
         dim3 block(128);
         paged_attn_kernel<128, 128, 16><<<grid, block, 0, stream>>>(
-            Q, K_cache, V_cache, block_table, num_blocks_used, seq_len,
+            Q, K_cache, V_cache, block_table, num_blocks_used, seq_len, start_pos,
             S_q, H_q, H_kv, num_kv_groups, max_blocks_per_seq, layer,
-            num_blocks, scale, is_prefill, output);
+            num_blocks, scale, is_prefill, sliding_window, output);
     } else {
         dim3 block(64);
         paged_attn_kernel<64, 64, 16><<<grid, block, 0, stream>>>(
-            Q, K_cache, V_cache, block_table, num_blocks_used, seq_len,
+            Q, K_cache, V_cache, block_table, num_blocks_used, seq_len, start_pos,
             S_q, H_q, H_kv, num_kv_groups, max_blocks_per_seq, layer,
-            num_blocks, scale, is_prefill, output);
+            num_blocks, scale, is_prefill, sliding_window, output);
     }
 }
 

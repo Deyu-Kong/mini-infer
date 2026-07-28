@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "kernels/gelu_kernel.cuh"
+#include "kernels/model_utils_kernel.cuh"
 #include "kernels/swiglu_kernel.cuh"
 
 namespace mini_infer {
@@ -129,8 +131,8 @@ void gemm_rowmajor_f16(cublasHandle_t handle,
 }
 }  // namespace
 
-MLP::MLP(int64_t hidden, int64_t intermediate, int device_index)
-    : hidden_(hidden), intermediate_(intermediate), device_index_(device_index),
+MLP::MLP(int64_t hidden, int64_t intermediate, int device_index, ActKind act)
+    : hidden_(hidden), intermediate_(intermediate), device_index_(device_index), act_(act),
       w_gate_(Tensor::empty({intermediate, hidden}, DType::FP16, Device::cuda(device_index))),
       w_up_(Tensor::empty({intermediate, hidden}, DType::FP16, Device::cuda(device_index))),
       w_down_(Tensor::empty({hidden, intermediate}, DType::FP16, Device::cuda(device_index))) {
@@ -155,12 +157,13 @@ MLP::MLP(MLP&& other) noexcept {
     hidden_       = other.hidden_;
     intermediate_ = other.intermediate_;
     device_index_ = other.device_index_;
+    act_          = other.act_;
     w_gate_       = std::move(other.w_gate_);
     w_up_         = std::move(other.w_up_);
     w_down_       = std::move(other.w_down_);
     gate_buf_     = std::move(other.gate_buf_);
     up_buf_       = std::move(other.up_buf_);
-    silu_buf_     = std::move(other.silu_buf_);
+    act_buf_      = std::move(other.act_buf_);
     cublas_handle_ = other.cublas_handle_;
     other.cublas_handle_ = nullptr;
 }
@@ -171,23 +174,25 @@ MLP& MLP::operator=(MLP&& other) noexcept {
         hidden_       = other.hidden_;
         intermediate_ = other.intermediate_;
         device_index_ = other.device_index_;
+        act_          = other.act_;
         w_gate_       = std::move(other.w_gate_);
         w_up_         = std::move(other.w_up_);
         w_down_       = std::move(other.w_down_);
         gate_buf_     = std::move(other.gate_buf_);
         up_buf_       = std::move(other.up_buf_);
-        silu_buf_     = std::move(other.silu_buf_);
+        act_buf_      = std::move(other.act_buf_);
         cublas_handle_ = other.cublas_handle_;
         other.cublas_handle_ = nullptr;
     }
     return *this;
 }
 
-void MLP::init(int64_t hidden, int64_t intermediate, int device_index) {
+void MLP::init(int64_t hidden, int64_t intermediate, int device_index, ActKind act) {
     if (hidden_ != 0) return;  // already initialized
     hidden_ = hidden;
     intermediate_ = intermediate;
     device_index_ = device_index;
+    act_ = act;
     // Don't allocate weights here - they will be set by set_weights()
     MI_CHECK_CUDA(cudaSetDevice(device_index));
     cublasStatus_t s = cublasCreate(reinterpret_cast<cublasHandle_t*>(&cublas_handle_));
@@ -199,8 +204,6 @@ void MLP::init(int64_t hidden, int64_t intermediate, int device_index) {
 }
 
 void MLP::set_weights(const Tensor& w_gate, const Tensor& w_up, const Tensor& w_down) {
-    std::fprintf(stderr, "MLP::set_weights called with intermediate_=%ld, hidden_=%ld\n",
-                 intermediate_, hidden_);
     auto need = [&](const Tensor& t, const std::vector<int64_t>& sh) {
         if (t.dtype() != DType::FP16) {
             throw std::runtime_error("MLP weights must be FP16");
@@ -239,7 +242,7 @@ Tensor MLP::forward(const Tensor& x) {
     if (gate_buf_.numel() != static_cast<int64_t>(B) * intermediate_) {
         gate_buf_ = Tensor::empty({B, intermediate_}, DType::FP16, Device::cuda(device_index_));
         up_buf_   = Tensor::empty({B, intermediate_}, DType::FP16, Device::cuda(device_index_));
-        silu_buf_ = Tensor::empty({B, intermediate_}, DType::FP16, Device::cuda(device_index_));
+        act_buf_  = Tensor::empty({B, intermediate_}, DType::FP16, Device::cuda(device_index_));
     }
 
     Tensor y = Tensor::empty({B, hidden_}, DType::FP16, Device::cuda(device_index_));
@@ -264,31 +267,34 @@ Tensor MLP::forward(const Tensor& x) {
         static_cast<__half*>(up_buf_.data()), static_cast<int>(intermediate_),
         one, zero);
 
-    // SwiGLU: silu(gate) * up — fused kernel reads gate, up, writes silu_buf.
-    kernels::launch_swiglu(
-        static_cast<const __half*>(gate_buf_.data()),
-        static_cast<const __half*>(up_buf_.data()),
-        static_cast<__half*>(silu_buf_.data()),
-        static_cast<int>(B * intermediate_),
-        /*stream=*/0);
-    
-    // Debug: print gate, up, and silu buffers
-    static int mlp_call_count = 0;
-    if (mlp_call_count == 0 || mlp_call_count == 3) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "mlp_layer%d_gate", mlp_call_count);
-        // debug_print_tensor(buf, gate_buf_);
-        snprintf(buf, sizeof(buf), "mlp_layer%d_up", mlp_call_count);
-        // debug_print_tensor(buf, up_buf_);
-        snprintf(buf, sizeof(buf), "mlp_layer%d_silu", mlp_call_count);
-        // debug_print_tensor(buf, silu_buf_);
+// Activation * up. Two kernels:
+    //   - SwiGLU  : fused silu(gate) * up   (one elementwise kernel)
+    //   - GeGLU   : gelu_tanh(gate), then in-place multiply by up
+    if (act_ == ActKind::Silu) {
+        kernels::launch_swiglu(
+            static_cast<const __half*>(gate_buf_.data()),
+            static_cast<const __half*>(up_buf_.data()),
+            static_cast<__half*>(act_buf_.data()),
+            static_cast<int>(B * intermediate_),
+            /*stream=*/0);
+    } else {
+        // GeGLU: act_buf = gelu_tanh(gate); then act_buf *= up
+        kernels::launch_gelu_tanh(
+            static_cast<const __half*>(gate_buf_.data()),
+            static_cast<__half*>(act_buf_.data()),
+            static_cast<int64_t>(B) * intermediate_,
+            /*stream=*/0);
+        kernels::launch_mul_inplace(
+            static_cast<__half*>(act_buf_.data()),
+            static_cast<const __half*>(up_buf_.data()),
+            static_cast<int64_t>(B) * intermediate_,
+            /*stream=*/0);
     }
-    mlp_call_count++;
 
-    // down = silu_buf @ W_down^T  (M=B, N=H, K=I)
+    // down = act_buf @ W_down^T  (M=B, N=H, K=I)
     gemm_rowmajor_f16(handle,
         B, static_cast<int>(hidden_), static_cast<int>(intermediate_),
-        static_cast<const __half*>(silu_buf_.data()), static_cast<int>(intermediate_),
+        static_cast<const __half*>(act_buf_.data()), static_cast<int>(intermediate_),
         static_cast<const __half*>(w_down_.data()), static_cast<int>(intermediate_),
         static_cast<__half*>(y.data()), static_cast<int>(hidden_),
         one, zero);

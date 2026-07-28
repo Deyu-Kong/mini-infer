@@ -11,6 +11,7 @@
 
 #include "kernels/model_utils_kernel.cuh"
 #include "kernels/paged_attn_kernel.cuh"
+#include "kernels/rmsnorm_kernel.cuh"
 #include "scheduler/paged_kv_cache.h"
 
 namespace mini_infer {
@@ -88,6 +89,14 @@ void Attention::init(int64_t hidden, int64_t num_heads, int64_t num_kv_heads,
     rope_k_ = std::make_unique<RoPE>(head_dim, rope_theta_, device_index_);
 }
 
+void Attention::set_qk_norm(int64_t head_dim, float eps, int device_index) {
+    use_qk_norm_ = true;
+    qk_norm_eps_ = eps;
+    // Allocate [head_dim] FP16 buffers; they get filled by set_qk_norm_weights.
+    w_q_norm_ = Tensor::empty({head_dim}, DType::FP16, Device::cuda(device_index));
+    w_k_norm_ = Tensor::empty({head_dim}, DType::FP16, Device::cuda(device_index));
+}
+
 Attention::~Attention() {
     if (cublas_handle_) {
         cublasDestroy(get_cublas(cublas_handle_));
@@ -110,6 +119,13 @@ Attention::Attention(Attention&& other) noexcept
       b_k_(std::move(other.b_k_)),
       b_v_(std::move(other.b_v_)),
       has_bias_(other.has_bias_),
+      w_q_norm_(std::move(other.w_q_norm_)),
+      w_k_norm_(std::move(other.w_k_norm_)),
+      use_qk_norm_(other.use_qk_norm_),
+      qk_norm_eps_(other.qk_norm_eps_),
+      sliding_window_(other.sliding_window_),
+      use_local_rope_(other.use_local_rope_),
+      local_rope_theta_(other.local_rope_theta_),
       q_buf_(std::move(other.q_buf_)),
       k_buf_(std::move(other.k_buf_)),
       v_buf_(std::move(other.v_buf_)),
@@ -141,6 +157,13 @@ Attention& Attention::operator=(Attention&& other) noexcept {
         b_k_ = std::move(other.b_k_);
         b_v_ = std::move(other.b_v_);
         has_bias_ = other.has_bias_;
+        w_q_norm_ = std::move(other.w_q_norm_);
+        w_k_norm_ = std::move(other.w_k_norm_);
+        use_qk_norm_ = other.use_qk_norm_;
+        qk_norm_eps_ = other.qk_norm_eps_;
+        sliding_window_ = other.sliding_window_;
+        use_local_rope_ = other.use_local_rope_;
+        local_rope_theta_ = other.local_rope_theta_;
         q_buf_ = std::move(other.q_buf_);
         k_buf_ = std::move(other.k_buf_);
         v_buf_ = std::move(other.v_buf_);
@@ -184,6 +207,22 @@ void Attention::set_weights(Tensor w_q, Tensor w_k, Tensor w_v, Tensor w_o,
         b_k_ = b_k.to(Device::cuda(device_index_));
         b_v_ = b_v.to(Device::cuda(device_index_));
     }
+}
+
+void Attention::set_qk_norm_weights(const Tensor& w_q_norm,
+                                   const Tensor& w_k_norm) {
+    if (!use_qk_norm_) {
+        throw std::runtime_error(
+            "Attention::set_qk_norm_weights: call set_qk_norm() first");
+    }
+    if (w_q_norm.dtype() != DType::FP16 || w_k_norm.dtype() != DType::FP16) {
+        throw std::runtime_error("Attention qk_norm weights must be FP16");
+    }
+    if (w_q_norm.numel() != head_dim_ || w_k_norm.numel() != head_dim_) {
+        throw std::runtime_error("Attention qk_norm weight size mismatch");
+    }
+    w_q_norm_ = w_q_norm.to(Device::cuda(device_index_));
+    w_k_norm_ = w_k_norm.to(Device::cuda(device_index_));
 }
 Tensor Attention::forward(const Tensor& hidden_states,
                           const std::vector<int64_t>& positions,
@@ -258,20 +297,67 @@ Tensor Attention::forward(const Tensor& hidden_states,
         }
     }
 
-    // RoPE on Q and K. Both use the same inv_freq but operate on different
-    // tensors. We need to reshape from [B, S, H_*D] to [B, S, num_*heads, head_dim].
+    // Q/K RMSNorm pre-RoPE (Gemma 3 only). Applied in-place on the
+    // 4-D view that we'll feed into RoPE.
     Tensor q_4d({B, S, static_cast<int>(num_heads_), static_cast<int>(head_dim_)},
                 DType::FP16, Device::cuda(device_index_));
     cudaMemcpy(q_4d.data(), q_buf_.data(),
                static_cast<int64_t>(B) * S * Hq * sizeof(__half),
                cudaMemcpyDeviceToDevice);
-    
+
     Tensor k_4d({B, S, static_cast<int>(num_kv_heads_), static_cast<int>(head_dim_)},
                 DType::FP16, Device::cuda(device_index_));
     cudaMemcpy(k_4d.data(), k_scratch_.data(),
                static_cast<int64_t>(B) * S * Hkv * sizeof(__half),
                cudaMemcpyDeviceToDevice);
-    
+
+    if (use_qk_norm_) {
+        // Reshape to [B*S, head_dim] for the RMSNorm kernel (which expects
+        // a 2-D input). RMSNorm can also be run in-place: we pass the
+        // same buffer as both src and dst.
+        const int64_t total_q = static_cast<int64_t>(B) * S * num_heads_;
+        const int64_t total_k = static_cast<int64_t>(B) * S * num_kv_heads_;
+        Tensor q_flat = Tensor::empty({total_q, head_dim_}, DType::FP16,
+                                      Device::cuda(device_index_));
+        Tensor k_flat = Tensor::empty({total_k, head_dim_}, DType::FP16,
+                                      Device::cuda(device_index_));
+        cudaMemcpy(q_flat.data(), q_4d.data(),
+                   total_q * head_dim_ * sizeof(__half),
+                   cudaMemcpyDeviceToDevice);
+        cudaMemcpy(k_flat.data(), k_4d.data(),
+                   total_k * head_dim_ * sizeof(__half),
+                   cudaMemcpyDeviceToDevice);
+        kernels::launch_rmsnorm(
+            static_cast<const __half*>(q_flat.data()),
+            static_cast<const __half*>(w_q_norm_.data()),
+            static_cast<__half*>(q_flat.data()),
+            static_cast<int>(total_q), static_cast<int>(head_dim_),
+            qk_norm_eps_, 0, /*stream=*/0);
+        kernels::launch_rmsnorm(
+            static_cast<const __half*>(k_flat.data()),
+            static_cast<const __half*>(w_k_norm_.data()),
+            static_cast<__half*>(k_flat.data()),
+            static_cast<int>(total_k), static_cast<int>(head_dim_),
+            qk_norm_eps_, 0, /*stream=*/0);
+        cudaMemcpy(q_4d.data(), q_flat.data(),
+                   total_q * head_dim_ * sizeof(__half),
+                   cudaMemcpyDeviceToDevice);
+        cudaMemcpy(k_4d.data(), k_flat.data(),
+                   total_k * head_dim_ * sizeof(__half),
+                   cudaMemcpyDeviceToDevice);
+    }
+
+    // RoPE on Q and K. Both use the same inv_freq but operate on different
+    // tensors. We need to reshape from [B, S, H_*D] to [B, S, num_*heads, head_dim].
+    // For Gemma 3 dual-band: switch to local theta before this forward if
+    // this layer is a sliding layer.
+    if (use_local_rope_) {
+        rope_q_->set_theta_base(local_rope_theta_);
+        rope_k_->set_theta_base(local_rope_theta_);
+    } else {
+        rope_q_->set_theta_base(rope_theta_);
+        rope_k_->set_theta_base(rope_theta_);
+    }
     Tensor q_roped = rope_q_->forward(q_4d, positions);
     Tensor k_roped = rope_k_->forward(k_4d, positions);
 
@@ -314,7 +400,9 @@ Tensor Attention::forward(const Tensor& hidden_states,
         static_cast<int>(num_heads_),
         static_cast<int>(num_kv_heads_),
         static_cast<int>(head_dim_),
-        num_kv_groups, scale, is_prefill ? 1 : 0, /*stream=*/0);
+        num_kv_groups, scale, is_prefill ? 1 : 0,
+        static_cast<int>(sliding_window_),
+        /*stream=*/0);
 
     // O projection: out = attn_out @ W_o^T
     Tensor out = Tensor::empty({B, S, H}, DType::FP16, Device::cuda(device_index_));
@@ -418,7 +506,7 @@ Tensor Attention::forward_paged(const Tensor& hidden_states,
         }
     }
 
-    // ---- RoPE on Q and K ----------------------------------------------
+    // ---- Q/K RMSNorm (Gemma 3) and RoPE ---------------------------------
     q_4d_paged_ = Tensor({B, S, static_cast<int>(num_heads_), static_cast<int>(head_dim_)},
                           DType::FP16, Device::cuda(device_index_));
     MI_CHECK_CUDA_PG(cudaMemcpy(q_4d_paged_.data(), q_buf_.data(),
@@ -430,6 +518,34 @@ Tensor Attention::forward_paged(const Tensor& hidden_states,
         static_cast<int64_t>(B) * S * Hkv * sizeof(__half),
         cudaMemcpyDeviceToDevice));
 
+    if (use_qk_norm_) {
+        // Apply Q/K RMSNorm in-place on the 4-D view (head_dim is the last
+        // dimension, contiguous). launch_rmsnorm takes [N, D] 2-D; we pass
+        // q_4d_paged_ data as both src and dst (in-place).
+        const int64_t total_q = static_cast<int64_t>(B) * S * num_heads_;
+        const int64_t total_k = static_cast<int64_t>(B) * S * num_kv_heads_;
+        kernels::launch_rmsnorm(
+            static_cast<const __half*>(q_4d_paged_.data()),
+            static_cast<const __half*>(w_q_norm_.data()),
+            static_cast<__half*>(q_4d_paged_.data()),
+            static_cast<int>(total_q), static_cast<int>(head_dim_),
+            qk_norm_eps_, 0, /*stream=*/0);
+        kernels::launch_rmsnorm(
+            static_cast<const __half*>(k_4d_paged_.data()),
+            static_cast<const __half*>(w_k_norm_.data()),
+            static_cast<__half*>(k_4d_paged_.data()),
+            static_cast<int>(total_k), static_cast<int>(head_dim_),
+            qk_norm_eps_, 0, /*stream=*/0);
+    }
+
+    // Gemma 3 dual-band RoPE switch.
+    if (use_local_rope_) {
+        rope_q_->set_theta_base(local_rope_theta_);
+        rope_k_->set_theta_base(local_rope_theta_);
+    } else {
+        rope_q_->set_theta_base(rope_theta_);
+        rope_k_->set_theta_base(rope_theta_);
+    }
     Tensor q_roped = rope_q_->forward(q_4d_paged_, positions);
     Tensor k_roped = rope_k_->forward(k_4d_paged_, positions);
 
@@ -514,6 +630,7 @@ Tensor Attention::forward_paged(const Tensor& hidden_states,
         static_cast<const int*>(block_table_dev_.data()),
         static_cast<const int*>(num_blocks_used_dev_.data()),
         static_cast<const int*>(seq_len_dev_.data()),
+        static_cast<const int*>(start_pos_dev_.data()),
         B, S,
         static_cast<int>(num_heads_),
         static_cast<int>(num_kv_heads_),
@@ -524,6 +641,7 @@ Tensor Attention::forward_paged(const Tensor& hidden_states,
         num_blocks_pool,
         scale,
         is_prefill ? 1 : 0,
+        static_cast<int>(sliding_window_),
         static_cast<__half*>(attn_out_buf_.data()),
         /*stream=*/0);
 
@@ -621,7 +739,7 @@ Tensor Attention::forward_paged_batched(const Tensor& hidden_states,
             Mflat, Hkv, Mflat * Hkv, /*stream=*/0);
     }
 
-    // ---- RoPE on Q and K (positions is B*S long) ----------------------
+    // ---- Q/K RMSNorm (Gemma 3) and RoPE (positions is B*S long) -------
     q_4d_b_ = Tensor({B, S, static_cast<int>(num_heads_), static_cast<int>(head_dim_)},
                      DType::FP16, Device::cuda(device_index_));
     MI_CHECK_CUDA_PG(cudaMemcpy(q_4d_b_.data(), q_buf_.data(),
@@ -633,6 +751,31 @@ Tensor Attention::forward_paged_batched(const Tensor& hidden_states,
         static_cast<int64_t>(B) * S * Hkv * sizeof(__half),
         cudaMemcpyDeviceToDevice));
 
+    if (use_qk_norm_) {
+        const int64_t total_q = static_cast<int64_t>(B) * S * num_heads_;
+        const int64_t total_k = static_cast<int64_t>(B) * S * num_kv_heads_;
+        kernels::launch_rmsnorm(
+            static_cast<const __half*>(q_4d_b_.data()),
+            static_cast<const __half*>(w_q_norm_.data()),
+            static_cast<__half*>(q_4d_b_.data()),
+            static_cast<int>(total_q), static_cast<int>(head_dim_),
+            qk_norm_eps_, 0, /*stream=*/0);
+        kernels::launch_rmsnorm(
+            static_cast<const __half*>(k_4d_b_.data()),
+            static_cast<const __half*>(w_k_norm_.data()),
+            static_cast<__half*>(k_4d_b_.data()),
+            static_cast<int>(total_k), static_cast<int>(head_dim_),
+            qk_norm_eps_, 0, /*stream=*/0);
+    }
+
+    // Gemma 3 dual-band RoPE switch.
+    if (use_local_rope_) {
+        rope_q_->set_theta_base(local_rope_theta_);
+        rope_k_->set_theta_base(local_rope_theta_);
+    } else {
+        rope_q_->set_theta_base(rope_theta_);
+        rope_k_->set_theta_base(rope_theta_);
+    }
     Tensor q_roped = rope_q_->forward_batched(q_4d_b_, positions);
     Tensor k_roped = rope_k_->forward_batched(k_4d_b_, positions);
 
@@ -710,6 +853,7 @@ Tensor Attention::forward_paged_batched(const Tensor& hidden_states,
         static_cast<const int*>(block_tables_dev_.data()),
         static_cast<const int*>(num_blocks_used_b_dev_.data()),
         static_cast<const int*>(seq_len_b_dev_.data()),
+        static_cast<const int*>(start_pos_b_dev_.data()),
         B, S,
         static_cast<int>(num_heads_),
         static_cast<int>(num_kv_heads_),
@@ -720,6 +864,7 @@ Tensor Attention::forward_paged_batched(const Tensor& hidden_states,
         num_blocks_pool,
         scale,
         is_prefill ? 1 : 0,
+        static_cast<int>(sliding_window_),
         static_cast<__half*>(attn_out_b_.data()),
         /*stream=*/0);
 

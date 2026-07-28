@@ -44,7 +44,8 @@ __global__ void naive_attn_kernel(
     int S_q, int S_k, int H_q, int H_kv,
     int num_kv_groups,
     float scale,
-    int is_prefill) {
+    int is_prefill,
+    int sliding_window) {
     const int b   = blockIdx.z;
     const int h_q = blockIdx.y;
     const int sq  = blockIdx.x;
@@ -63,8 +64,13 @@ __global__ void naive_attn_kernel(
 
     // -------- compute scores for each key position -----------------------
     const int causal_offset = S_k - S_q;  // = cur_len for verify/prefill
+    const int q_global_pos = sq + causal_offset;   // global position of query
     for (int j = 0; j < S_k; ++j) {
-        if (is_prefill && j > sq + causal_offset) {
+        if (is_prefill && j > q_global_pos) {
+            scores[j] = -INFINITY;
+            continue;
+        }
+        if (sliding_window > 0 && j < q_global_pos - sliding_window + 1) {
             scores[j] = -INFINITY;
             continue;
         }
@@ -159,14 +165,16 @@ void launch_naive_attn(const __half* Q, const __half* K, const __half* V,
                        int B, int S_q, int S_k,
                        int H_q, int H_kv, int D,
                        int num_kv_groups, float scale,
-                       int is_prefill, cudaStream_t stream);
+                       int is_prefill,
+                       int sliding_window, cudaStream_t stream);
 
 void launch_naive_attn(const __half* Q, const __half* K, const __half* V,
                        __half* Out,
                        int B, int S_q, int S_k,
                        int H_q, int H_kv, int D,
                        int num_kv_groups, float scale,
-                       int is_prefill, cudaStream_t stream) {
+                       int is_prefill,
+                       int sliding_window, cudaStream_t stream) {
     constexpr int MAX_SK = 4096;  // ~64 KB shared memory at fp32
     dim3 grid(S_q, H_q, B);
     dim3 block(D);
@@ -175,11 +183,13 @@ void launch_naive_attn(const __half* Q, const __half* K, const __half* V,
     if (D == 128) {
         size_t shmem = S_k * sizeof(float);
         naive_attn_kernel<128, MAX_SK><<<grid, block, shmem, stream>>>(
-            Q, K, V, Out, S_q, S_k, H_q, H_kv, num_kv_groups, scale, is_prefill);
+            Q, K, V, Out, S_q, S_k, H_q, H_kv, num_kv_groups, scale,
+            is_prefill, sliding_window);
     } else if (D == 64) {
         size_t shmem = S_k * sizeof(float);
         naive_attn_kernel<64, MAX_SK><<<grid, block, shmem, stream>>>(
-            Q, K, V, Out, S_q, S_k, H_q, H_kv, num_kv_groups, scale, is_prefill);
+            Q, K, V, Out, S_q, S_k, H_q, H_kv, num_kv_groups, scale,
+            is_prefill, sliding_window);
     } else {
         // Fallback: not supported in W4. Caller is expected to use 64 or 128.
     }

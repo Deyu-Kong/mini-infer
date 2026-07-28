@@ -18,8 +18,23 @@
 namespace mini_infer {
 
 /**
- * Per-layer decoder block — RMSNorm -> Attention -> +residual ->
- *                              RMSNorm -> MLP -> +residual
+ * Per-layer decoder block.
+ *
+ *   - LLaMA / Qwen / Mistral / Yi / DeepSeek (2-norm block):
+ *
+ *         y = x + attn(input_norm(x))
+ *         z = y + mlp(post_attn_norm(y))
+ *
+ *   - Gemma 1 (2-norm block, GeGLU MLP):
+ *         Same as LLaMA, but MLP uses GeGLU.
+ *
+ *   - Gemma 2/3 (4-norm block, double-norm wrapping):
+ *
+ *         y = x + post_attn_norm(attn(input_norm(x)))
+ *         z = y + post_ffn_norm(mlp(pre_ffn_norm(y)))
+ *
+ *     `pre_feedforward_layernorm` and `post_feedforward_layernorm` are
+ *     only populated for Gemma 2/3.
  *
  * All components are constructed empty; `QwenModel::load_weights` fills
  * them from a WeightIndex. Each component owns its own device buffers.
@@ -27,8 +42,11 @@ namespace mini_infer {
 struct LayerWeights {
     RMSNorm          input_layernorm;
     RMSNorm          post_attn_layernorm;
+    RMSNorm          pre_feedforward_layernorm;   // Gemma 2/3 only
+    RMSNorm          post_feedforward_layernorm;  // Gemma 2/3 only
     MLP              mlp;
     Attention        attn;
+    bool             is_sliding = false;          // Gemma 2/3 sliding layer
 
     LayerWeights() = default;
     LayerWeights(const LayerWeights&) = delete;
@@ -48,9 +66,13 @@ struct LayerWeights {
  * Per-arch behaviour is driven by `ModelConfig::arch` (see model_config.h):
  *   - QwenLLaMA : RMSNorm (y = x * rrms * w), separate q/k/v_proj, optional
  *                 QKV bias (Qwen only). Embedding output is unscaled.
- *   - Gemma     : RMSNorm (y = x * rrms * (1 + w)), merged qkv_proj split
- *                 into Q/K/V on load. Embedding output multiplied by
- *                 sqrt(hidden_size).
+ *                 2-norm block. SwiGLU MLP.
+ *   - Gemma 1   : 2-norm block. GeGLU MLP. (1+w) RMSNorm. Scaled embeddings.
+ *   - Gemma 2   : 4-norm double-wrapped block. GeGLU MLP. Sliding window
+ *                 on alternating layers.
+ *   - Gemma 3   : Everything Gemma 2 has, plus Q/K RMSNorm pre-RoPE and
+ *                 dual-band RoPE (global theta on global layers, local
+ *                 theta on sliding layers).
  */
 class QwenModel {
 public:

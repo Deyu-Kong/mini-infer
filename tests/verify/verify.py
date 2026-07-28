@@ -82,6 +82,15 @@ def op_swiglu(args):
     return ref, ours
 
 
+def op_gelu_tanh(args):
+    # args: input.bin our.bin [shape]
+    x    = to_f32(load_f16(args.inputs[0])).reshape(args.shape)
+    ours = to_f32(load_f16(args.our_output)).reshape(args.shape)
+    # PyTorch `F.gelu(x, approximate='tanh')` is the formula Gemma uses.
+    ref  = torch.nn.functional.gelu(x, approximate="tanh")
+    return ref, ours
+
+
 def op_mlp(args):
     # inputs: x, w_gate, w_up, w_down
     # shape: [B, H, I]  (hidden H, intermediate I)
@@ -99,11 +108,12 @@ def op_mlp(args):
 
 
 OPS = {
-    "rmsnorm": op_rmsnorm,
-    "rope":    op_rope,
-    "softmax": op_softmax,
-    "swiglu":  op_swiglu,
-    "mlp":     op_mlp,
+    "rmsnorm":   op_rmsnorm,
+    "rope":      op_rope,
+    "softmax":   op_softmax,
+    "swiglu":    op_swiglu,
+    "gelu_tanh": op_gelu_tanh,
+    "mlp":       op_mlp,
 }
 
 

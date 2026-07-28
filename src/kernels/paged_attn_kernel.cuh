@@ -29,12 +29,18 @@ namespace kernels {
  *                   how many entries of block_table are valid for each request
  *   seq_len      : [B]                         int32, CUDA
  *                   current sequence length (must be <= num_blocks_used * BLOCK_SIZE)
+ *   start_pos    : [B]                         int32, CUDA
+ *                   global position where the new tokens begin for each
+ *                   sequence (typically seq_len[b] - S_q).
  *   S_q          : int                          # of query positions per request
  *                   =1 for decode, =prompt_len for prefill
  *   layer        : int                          which layer's K/V to read
  *   scale        : float                        1 / sqrt(head_dim)
  *   num_kv_groups: int                          H_q / H_kv  (GQA ratio)
  *   is_prefill   : int (0 or 1)                 1 -> apply causal mask
+ *   sliding_window: int                         if > 0, additionally mask
+ *                   tokens whose global position is more than
+ *                   `sliding_window` steps behind the query (Gemma 2/3).
  *
  * Output:
  *   output       : [B, S_q, H_q, head_dim]     FP16, CUDA
@@ -58,6 +64,7 @@ void launch_paged_attn(const __half* Q,
                        const int* block_table,
                        const int* num_blocks_used,
                        const int* seq_len,
+                       const int* start_pos,            // [B] global start of new tokens
                        int B,
                        int S_q,
                        int H_q,
@@ -69,6 +76,7 @@ void launch_paged_attn(const __half* Q,
                        int num_blocks,
                        float scale,
                        int is_prefill,
+                       int sliding_window,               // 0 = disabled
                        __half* output,
                        cudaStream_t stream);
 

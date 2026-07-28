@@ -14,13 +14,23 @@ RoPE::RoPE(int head_dim, float theta_base, int device_index)
     if (head_dim_ <= 0 || (head_dim_ & 1) != 0) {
         throw std::runtime_error("RoPE: head_dim must be positive even");
     }
+    recompute_inv_freq_();
+}
+
+void RoPE::recompute_inv_freq_() {
     const int half = head_dim_ / 2;
     inv_freq_.resize(half);
     for (int i = 0; i < half; ++i) {
-        // Qwen2.5-style: inv_freq[i] = 1 / theta_base^(2i/dim)
+        // Qwen2.5 / LLaMA / Gemma convention:
+        //   inv_freq[i] = 1 / theta_base^(2i/dim)
         const float exp = (2.0f * i) / static_cast<float>(head_dim_);
         inv_freq_[i] = 1.0f / std::pow(theta_base_, exp);
     }
+}
+
+void RoPE::set_theta_base(float theta_base) {
+    theta_base_ = theta_base;
+    recompute_inv_freq_();
 }
 
 Tensor RoPE::forward(const Tensor& x, const std::vector<int64_t>& positions) {
