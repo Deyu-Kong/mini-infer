@@ -15,6 +15,14 @@ void launch_embedding_gather(const int64_t* token_ids, const __half* embed_table
                               __half* out, int B, int S, int H, cudaStream_t stream);
 
 /**
+ * In-place embedding scale: y[i] *= scale  (FP16, row-major, on CUDA).
+ *
+ * Gemma multiplies the embedding-table output by sqrt(hidden_size).
+ * `scale` is passed in FP32 for precision (we cast to FP16 inside the kernel).
+ */
+void launch_scale_inplace(__half* y, float scale, int64_t n, cudaStream_t stream);
+
+/**
  * Scatter a (K or V) tensor into a paged KV cache.
  *
  * For each (b, s, kv_head, d) of the source tensor [B, S, H_kv, D], the

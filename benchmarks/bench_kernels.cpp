@@ -66,7 +66,8 @@ int main() {
             mini_infer::kernels::launch_rmsnorm(
                 static_cast<const __half*>(x.data()),
                 static_cast<const __half*>(w.data()),
-                static_cast<__half*>(y.data()), N, D, 1e-6f, 0);
+                static_cast<__half*>(y.data()), N, D, 1e-6f,
+                /*add_one=*/0, /*stream=*/0);
         };
         char name[64]; std::snprintf(name, sizeof(name),
                                      "rmsnorm N=%d D=%d", N, D);

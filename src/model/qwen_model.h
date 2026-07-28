@@ -38,11 +38,19 @@ struct LayerWeights {
 };
 
 /**
- * QwenModel — Qwen2.5 / LLaMA-style decoder.
+ * QwenModel — Qwen2.5 / LLaMA-style decoder, also covering the LLaMA
+ * family (LLaMA 2/3/3.1, Mistral, Yi, DeepSeek, ...) and Gemma 1/2/3.
  *
  * Loads weights from a HuggingFace safetensors index and owns the
  * per-layer components. `forward(...)` runs a prefill or decode step and
  * returns logits; `Engine::generate` wraps this in an autoregressive loop.
+ *
+ * Per-arch behaviour is driven by `ModelConfig::arch` (see model_config.h):
+ *   - QwenLLaMA : RMSNorm (y = x * rrms * w), separate q/k/v_proj, optional
+ *                 QKV bias (Qwen only). Embedding output is unscaled.
+ *   - Gemma     : RMSNorm (y = x * rrms * (1 + w)), merged qkv_proj split
+ *                 into Q/K/V on load. Embedding output multiplied by
+ *                 sqrt(hidden_size).
  */
 class QwenModel {
 public:

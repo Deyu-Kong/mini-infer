@@ -8,8 +8,8 @@
 
 namespace mini_infer {
 
-RMSNorm::RMSNorm(int64_t dim, float eps, int device_index)
-    : dim_(dim), eps_(eps), device_index_(device_index),
+RMSNorm::RMSNorm(int64_t dim, float eps, int device_index, bool add_one)
+    : dim_(dim), eps_(eps), device_index_(device_index), add_one_(add_one),
       weight_(Tensor::empty({dim}, DType::FP16, Device::cuda(device_index))) {}
 
 RMSNorm::~RMSNorm() = default;
@@ -18,6 +18,7 @@ RMSNorm::RMSNorm(RMSNorm&& other) noexcept {
     dim_          = other.dim_;
     eps_          = other.eps_;
     device_index_ = other.device_index_;
+    add_one_      = other.add_one_;
     weight_       = std::move(other.weight_);
 }
 
@@ -26,6 +27,7 @@ RMSNorm& RMSNorm::operator=(RMSNorm&& other) noexcept {
         dim_          = other.dim_;
         eps_          = other.eps_;
         device_index_ = other.device_index_;
+        add_one_      = other.add_one_;
         weight_       = std::move(other.weight_);
     }
     return *this;
@@ -75,7 +77,7 @@ Tensor RMSNorm::forward(const Tensor& x) const {
         static_cast<const __half*>(x.data()),
         static_cast<const __half*>(weight_.data()),
         static_cast<__half*>(y.data()),
-        N, D, eps_, /*stream=*/0);
+        N, D, eps_, add_one_ ? 1 : 0, /*stream=*/0);
 
     return y;
 }

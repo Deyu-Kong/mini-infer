@@ -144,6 +144,7 @@ mi_force_cuda(mini_infer_layers src/layers/mlp.cpp)
 add_library(mini_infer_model STATIC
     src/model/safetensors_loader.cpp
     src/model/qwen_model.cpp
+    src/model/weight_mapper.cpp
 )
 target_include_directories(mini_infer_model
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src

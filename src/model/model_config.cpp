@@ -41,6 +41,15 @@ std::string jget_str(const nlohmann::json& j, const char* key,
 
 }  // namespace
 
+ModelArch ModelConfig::arch_from_model_type(const std::string& mt) {
+    // Gemma uses model_type "gemma", "gemma2", "gemma3", "gemma3_text".
+    if (mt.rfind("gemma", 0) == 0) return ModelArch::Gemma;
+    // Everything else currently falls into the Qwen / LLaMA bucket. This
+    // includes: qwen2, qwen2_vl, llama, mistral, mixtral, yi, deepseek,
+    // phi3 (architecturally LLaMA-ish), gemma2 (handled above), etc.
+    return ModelArch::QwenLLaMA;
+}
+
 ModelConfig ModelConfig::load(const std::string& path) {
     std::ifstream f(path);
     if (!f) throw std::runtime_error("ModelConfig: cannot open " + path);
@@ -67,15 +76,64 @@ ModelConfig ModelConfig::load(const std::string& path) {
         c.architectures = j["architectures"][0].get<std::string>();
     }
 
+    // ---- arch-specific overrides --------------------------------------
+    c.arch = arch_from_model_type(c.model_type);
+    if (c.arch == ModelArch::Gemma) {
+        // Gemma sets `head_dim` independently. If it's present, use it.
+        // Otherwise derive (Gemma also uses hidden / num_heads but the JSON
+        // usually still lists it explicitly).
+        c.head_dim_override = jget_int(j, "head_dim", 0);
+        // Gemma's (1 + weight) RMSNorm variant.
+        c.rmsnorm_add_one = true;
+        // Gemma scales the embedding output by sqrt(hidden_size).
+        c.embed_scale = true;
+        // Gemma has no QKV bias.
+        c.has_qkv_bias = false;
+        // Gemma 1/2/3 all tie embed_tokens and lm_head by default. The
+        // config.json usually omits `tie_word_embeddings`; if it's missing
+        // for a Gemma config we assume tied.
+        if (!j.contains("tie_word_embeddings")) {
+            c.tie_word_embeddings = true;
+        }
+
+        // Gemma defaults: rope_theta 10000 unless overridden (Gemma 3 uses
+        // 1_000_000 but the JSON will say so).
+        if (c.rope_theta == 0.0f) c.rope_theta = 10000.0f;
+    } else {
+        // Qwen2 / LLaMA family.
+        // Qwen2/2.5 has q_proj.bias; LLaMA / Mistral / Yi / DeepSeek do not.
+        // We detect by architectures field: "Qwen2..." -> bias present.
+        const std::string& a = c.architectures;
+        if (a.rfind("Qwen", 0) == 0 || a.rfind("qwen", 0) == 0) {
+            c.has_qkv_bias = true;
+        } else {
+            c.has_qkv_bias = false;
+        }
+    }
+
+    // Mistral sliding window (ignored for now; we run full attention).
+    c.sliding_window = jget_int(j, "sliding_window", 0);
+
+    // ---- validation ----------------------------------------------------
     if (c.hidden_size == 0 || c.num_hidden_layers == 0 ||
         c.num_attention_heads == 0 || c.vocab_size == 0) {
         throw std::runtime_error("ModelConfig: missing required fields in " + path);
     }
-    if (c.hidden_size % c.num_attention_heads != 0) {
-        throw std::runtime_error("ModelConfig: hidden_size not divisible by num_attention_heads");
+    const int64_t hd = c.head_dim();
+    if (hd <= 0) {
+        throw std::runtime_error(
+            "ModelConfig: head_dim is non-positive (hidden_size=" +
+            std::to_string(c.hidden_size) + ", num_attention_heads=" +
+            std::to_string(c.num_attention_heads) + ", head_dim_override=" +
+            std::to_string(c.head_dim_override) + ")");
+    }
+    if (c.hidden_size != hd * c.num_attention_heads && c.head_dim_override == 0) {
+        throw std::runtime_error(
+            "ModelConfig: hidden_size not divisible by num_attention_heads");
     }
     if (c.num_attention_heads % c.num_key_value_heads != 0) {
-        throw std::runtime_error("ModelConfig: num_attention_heads not divisible by num_key_value_heads (GQA)");
+        throw std::runtime_error(
+            "ModelConfig: num_attention_heads not divisible by num_key_value_heads (GQA)");
     }
     return c;
 }

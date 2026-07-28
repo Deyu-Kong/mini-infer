@@ -2,9 +2,18 @@
 
 ## Current State
 
-`ModelConfig` + `QwenModel::load_weights` hardcode Qwen2.5's config field names and safetensors weight names. The core components (RMSNorm, RoPE, SwiGLU, GQA) are already generic — the bottleneck is **config parsing** and **weight name mapping**.
+`ModelConfig` + `QwenModel::load_weights` used to hardcode Qwen2.5's config
+field names and safetensors weight names. The core components (RMSNorm, RoPE,
+SwiGLU, GQA) are already generic — the bottleneck is **config parsing** and
+**weight name mapping**.
 
-## Phase 1: LLaMA Family (1-2 days)
+As of mid-2026, Phase 1 (LLaMA family) and Phase 2 (Gemma 1/2/3) are
+implemented. `ModelConfig` carries a `ModelArch` enum (`QwenLLaMA`, `Gemma`)
+selected from `model_type`; `WeightNameMapper` returns per-layer HF
+weight names per arch; RMSNorm has an `add_one_` flag for Gemma;
+`QwenModel::forward` scales embeddings by `sqrt(hidden_size)` for Gemma.
+
+## Phase 1: LLaMA Family (DONE)
 
 Cover LLaMA 2/3/3.1, Mistral, Yi, DeepSeek, etc. These share RMSNorm + RoPE + SwiGLU + GQA with Qwen2.5.
 
@@ -37,7 +46,37 @@ Cover LLaMA 2/3/3.1, Mistral, Yi, DeepSeek, etc. These share RMSNorm + RoPE + Sw
 
 - `src/model/weight_mapper.h/cpp` — weight name mapping abstraction
 
-## Phase 2: Gemma Support (half day)
+## Phase 2: Gemma Support (DONE)
+
+### What's done
+
+- `ModelConfig::arch` is set to `ModelArch::Gemma` whenever `model_type`
+  starts with `gemma` (gemma, gemma2, gemma3, gemma3_text).
+- `RMSNorm::add_one_` makes the kernel use `y = x * rrms * (1 + w)` for Gemma.
+- `QwenModel::forward` (and paged / batched variants) apply
+  `y *= sqrt(hidden_size)` after the embedding lookup when `embed_scale` is set.
+- `WeightNameMapper` produces the right per-layer names for both QwenLLaMA
+  and Gemma, and `load_qkv` handles the (rare) merged `qkv_proj.weight`
+  for Gemma checkpoints that store Q/K/V together.
+
+### Still TODO for full Gemma inference
+
+The plan's "half day" estimate only covered RMSNorm/embedding scale/weight
+names. Actual Gemma inference needs:
+
+1. **GeGLU MLP**: Gemma uses `gelu_pytorch_tanh` instead of `silu` — current
+   `MLP` is SwiGLU. Need an `MLP::set_activation(Act::GeLU)` switch and a
+   `gelu_kernel.cu`.
+2. **Per-layer RMSNorm count**: Gemma 2/3 has 4 norms per block
+   (`input_layernorm`, `post_attention_layernorm`,
+   `pre_feedforward_layernorm`, `post_feedforward_layernorm`); current
+   model only has 2.
+3. **q_norm / k_norm**: Gemma 3 RMSNorm-applies Q and K before RoPE.
+4. **Sliding window attention** (Gemma 2/3): alternate layers use a
+   local sliding window; needs an `attn_mask` kernel integration.
+5. **Two RoPE bands** (Gemma 3): global vs local RoPE inv_freq.
+
+These belong to a follow-up Phase 2.5 / Phase 3 work item.
 
 ### Changes
 
@@ -50,7 +89,7 @@ Cover LLaMA 2/3/3.1, Mistral, Yi, DeepSeek, etc. These share RMSNorm + RoPE + Sw
 - `src/layers/rmsnorm.h/cpp` — add `add_one_` variant
 - `src/model/qwen_model.cpp` — embedding scale for Gemma
 
-## Phase 3: Architecture Abstraction (2-3 days, optional)
+## Phase 3: Architecture Abstraction (TODO — covers Gemma 2.5 + MoE prep)
 
 Rename `QwenModel` to `TransformerModel`, introduce `ModelArch` enum:
 

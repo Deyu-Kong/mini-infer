@@ -34,7 +34,13 @@ def op_rmsnorm(args):
     weight = to_f32(load_f16(args.inputs[0]))
     x      = to_f32(load_f16(args.inputs[1])).reshape(args.shape)
     ours   = to_f32(load_f16(args.our_output)).reshape(args.shape)
-    ref    = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + args.eps) * weight
+    rrms   = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + args.eps)
+    if getattr(args, "add_one", False):
+        # Gemma variant: y = x * rrms * (1 + weight)
+        ref = x * rrms * (1.0 + weight)
+    else:
+        # Qwen / LLaMA / etc.: y = x * rrms * weight
+        ref = x * rrms * weight
     return ref, ours
 
 
@@ -108,6 +114,8 @@ def main():
     ap.add_argument("--our-output", required=True)
     ap.add_argument("--shape", type=int, nargs="+", required=True)
     ap.add_argument("--eps", type=float, default=1e-6)
+    ap.add_argument("--add-one", action="store_true",
+                    help="rmsnorm: use Gemma (1 + weight) variant")
     args = ap.parse_args()
 
     if args.op not in OPS:

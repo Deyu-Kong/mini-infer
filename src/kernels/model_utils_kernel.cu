@@ -63,6 +63,21 @@ void launch_embedding_gather(const int64_t* token_ids, const __half* embed_table
         token_ids, embed_table, out, B, S, H);
 }
 
+// y[i] *= scale  (FP16, in-place). Used by Gemma to scale embeddings by
+// sqrt(hidden_size).
+__global__ void scale_inplace_kernel(__half* y, float scale, int64_t n) {
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    y[i] = __float2half(__half2float(y[i]) * scale);
+}
+
+void launch_scale_inplace(__half* y, float scale, int64_t n, cudaStream_t s) {
+    if (n == 0) return;
+    int block = 256;
+    int grid = static_cast<int>((n + block - 1) / block);
+    scale_inplace_kernel<<<grid, block, 0, s>>>(y, scale, n);
+}
+
 // ===========================================================================
 // Paged KV scatter (Week 5)
 // ===========================================================================

@@ -99,12 +99,46 @@ int main() {
     Tensor y_dev = norm.forward(x.to(Device::cuda(0)));
     Tensor y     = y_dev.to(Device::cpu());
 
-    // 3. dump artifacts
+    // 2b. Gemma-style (1 + weight) variant on the same inputs.
+    mini_infer::RMSNorm norm_gemma(D, eps, /*device=*/0, /*add_one=*/true);
+    norm_gemma.set_weight(w);
+    Tensor y_gemma_dev = norm_gemma.forward(x.to(Device::cuda(0)));
+    Tensor y_gemma     = y_gemma_dev.to(Device::cpu());
+
+    // Sanity: the Gemma variant must differ from the standard one (since
+    // the multiplier is (1 + w) instead of w), but should still be finite.
+    bool differ = false, finite = true;
+    {
+        const auto* ya = static_cast<const uint16_t*>(y.data());
+        const auto* yb = static_cast<const uint16_t*>(y_gemma.data());
+        const int64_t total = N * D;
+        for (int64_t i = 0; i < total; ++i) {
+            if (ya[i] != yb[i]) differ = true;
+            // FP16 inf/nan: exponent all 1s.
+            const uint16_t bits_a = ya[i];
+            const uint16_t bits_b = yb[i];
+            if ((bits_a & 0x7c00u) == 0x7c00u) finite = false;
+            if ((bits_b & 0x7c00u) == 0x7c00u) finite = false;
+        }
+    }
+    EXPECT(differ, "Gemma (1+w) variant differs from standard (w)");
+    EXPECT(finite, "Gemma (1+w) variant produces finite outputs");
+
+    // Dump artifacts (standard variant; existing test compares against torch).
     const std::string dir = "/tmp/mini_infer_rmsnorm";
     std::system(("mkdir -p " + dir).c_str());
     mini_infer::write_bin(dir + "/weight.bin", w);
     mini_infer::write_bin(dir + "/input.bin",  x);
     mini_infer::write_bin(dir + "/our.bin",    y);
+
+    // 4b. Also dump the Gemma variant outputs to a sibling directory and
+    // compare against the same torch reference but with the (1 + weight)
+    // multiplier.
+    const std::string gdir = "/tmp/mini_infer_rmsnorm_gemma";
+    std::system(("mkdir -p " + gdir).c_str());
+    mini_infer::write_bin(gdir + "/weight.bin", w);
+    mini_infer::write_bin(gdir + "/input.bin",  x);
+    mini_infer::write_bin(gdir + "/our.bin",    y_gemma);
 
     // 4. invoke python verifier
     std::string cmd = "python3 tests/verify/verify.py rmsnorm "
@@ -115,6 +149,17 @@ int main() {
         + " 2>&1";
     int rc = mini_infer::run_cmd(cmd);
     EXPECT(rc == 0, "matches torch reference");
+
+    // Gemma (1 + weight) variant
+    std::string gcmd = "python3 tests/verify/verify.py rmsnorm "
+        + gdir + "/weight.bin " + gdir + "/input.bin "
+        + " --our-output " + gdir + "/our.bin"
+        + " --shape " + std::to_string(N) + " " + std::to_string(D)
+        + " --eps " + std::to_string(eps)
+        + " --add-one"
+        + " 2>&1";
+    int grc = mini_infer::run_cmd(gcmd);
+    EXPECT(grc == 0, "Gemma (1+w) variant matches torch reference");
 
     // 5. latency
     cudaEvent_t s, e;

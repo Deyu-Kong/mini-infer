@@ -1,7 +1,9 @@
 /**
  * RMSNorm CUDA kernel — one block per row.
  *
- * Formula:  y = (x / sqrt(mean(x^2) + eps)) * weight
+ * Formula:  y = (x / sqrt(mean(x^2) + eps)) * f(weight)
+ *   where f(w) = w             for Qwen / LLaMA / Mistral / Yi / etc.
+ *         f(w) = (1 + w)       for Gemma.
  *
  * Storage layout (row-major):
  *   x       : [N, D]   FP16
@@ -30,7 +32,7 @@ __global__ void rmsnorm_kernel(
     const __half* __restrict__ x,
     const __half* __restrict__ weight,
     __half* __restrict__ y,
-    int N, int D, float eps) {
+    int N, int D, float eps, int add_one) {
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
 
@@ -54,22 +56,28 @@ __global__ void rmsnorm_kernel(
     for (int i = tid; i < D; i += BLOCK_SIZE) {
         float xv = __half2float(x_row[i]);
         float wv = __half2float(weight[i]);
-        y_row[i] = __float2half(xv * rrms * wv);
+        if (add_one) {
+            // Gemma: y = x * rrms * (1 + w)
+            y_row[i] = __float2half(xv * rrms * (1.0f + wv));
+        } else {
+            // Qwen / LLaMA / etc.: y = x * rrms * w
+            y_row[i] = __float2half(xv * rrms * wv);
+        }
     }
 }
 
 void launch_rmsnorm(const __half* x, const __half* weight, __half* y,
-                    int N, int D, float eps, cudaStream_t stream) {
+                    int N, int D, float eps, int add_one, cudaStream_t stream) {
     // Pick block size based on D. Qwen2.5 hidden_dim = 3584 (large) so 512
     // threads works well. Smaller dims use smaller blocks.
     if (D >= 4096) {
-        rmsnorm_kernel<512><<<N, 512, 0, stream>>>(x, weight, y, N, D, eps);
+        rmsnorm_kernel<512><<<N, 512, 0, stream>>>(x, weight, y, N, D, eps, add_one);
     } else if (D >= 1024) {
-        rmsnorm_kernel<256><<<N, 256, 0, stream>>>(x, weight, y, N, D, eps);
+        rmsnorm_kernel<256><<<N, 256, 0, stream>>>(x, weight, y, N, D, eps, add_one);
     } else if (D >= 256) {
-        rmsnorm_kernel<128><<<N, 128, 0, stream>>>(x, weight, y, N, D, eps);
-    } else {
-        rmsnorm_kernel<64><<<N, 64, 0, stream>>>(x, weight, y, N, D, eps);
+        rmsnorm_kernel<128><<<N, 128, 0, stream>>>(x, weight, y, N, D, eps, add_one);
+} else {
+        rmsnorm_kernel<64><<<N, 64, 0, stream>>>(x, weight, y, N, D, eps, add_one);
     }
 }
 

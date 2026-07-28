@@ -13,6 +13,7 @@
 #include "core/dtype_utils.h"
 #include "layers/rmsnorm.h"
 #include "kernels/model_utils_kernel.cuh"
+#include "model/weight_mapper.h"
 #include "scheduler/paged_kv_cache.h"
 
 namespace mini_infer {
@@ -60,29 +61,7 @@ static void debug_print_tensor(const char* name, const Tensor& t, int max_elemen
 }
 
 // Convert a CPU tensor to FP16 (same device). Supports BF16 / FP32 inputs.
-Tensor convert_cpu_to_f16(const Tensor& src) {
-    if (src.dtype() == DType::FP16) return src;
-    Tensor dst(src.shape(), DType::FP16, Device::cpu());
-    const int64_t n = src.numel();
-    if (src.dtype() == DType::BF16) {
-        const auto* s = static_cast<const uint16_t*>(src.data());
-        auto*       d = static_cast<uint16_t*>(dst.data());
-        for (int64_t i = 0; i < n; ++i) {
-            const uint32_t f32_bits = static_cast<uint32_t>(s[i]) << 16;
-            float f; std::memcpy(&f, &f32_bits, 4);
-            d[i] = f32_to_f16_bits(f);
-        }
-        return dst;
-    }
-    if (src.dtype() == DType::FP32) {
-        const auto* s = static_cast<const float*>(src.data());
-        auto*       d = static_cast<uint16_t*>(dst.data());
-        for (int64_t i = 0; i < n; ++i) d[i] = f32_to_f16_bits(s[i]);
-        return dst;
-    }
-    throw std::runtime_error("convert_cpu_to_f16: unsupported dtype " +
-                             std::string(dtype_name(src.dtype())));
-}
+// Defined in weight_mapper.cpp; not needed here.
 
 void require_shape(const Tensor& t, const std::vector<int64_t>& want,
                    const std::string& name) {
@@ -101,13 +80,6 @@ void require_shape(const Tensor& t, const std::vector<int64_t>& want,
         o << "]";
         throw std::runtime_error(o.str());
     }
-}
-
-Tensor upload_as_f16(const WeightIndex& idx, const std::string& name,
-                     int device_index) {
-    Tensor cpu = idx.read_to_cpu(name);
-    Tensor cpu_f16 = convert_cpu_to_f16(cpu);
-    return cpu_f16.to(Device::cuda(device_index));
 }
 
 // Small helper for summarize(): FP16 mean/std via host loop.
@@ -146,15 +118,18 @@ static void f16_stats(const Tensor& t, float& mean, float& stddev,
 QwenModel::QwenModel(const ModelConfig& cfg, int device_index)
     : cfg_(cfg),
       device_index_(device_index),
-      final_norm_(cfg.hidden_size, cfg.rms_norm_eps, device_index) {
+      final_norm_(cfg.hidden_size, cfg.rms_norm_eps, device_index,
+                  cfg.rmsnorm_add_one) {
     if (cfg.num_hidden_layers <= 0) {
         throw std::runtime_error("QwenModel: invalid num_hidden_layers");
     }
     layers_.reserve(cfg.num_hidden_layers);
     for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
         LayerWeights lw;
-        lw.input_layernorm     = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, device_index);
-        lw.post_attn_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps, device_index);
+        lw.input_layernorm     = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                         device_index, cfg.rmsnorm_add_one);
+        lw.post_attn_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
+                                         device_index, cfg.rmsnorm_add_one);
         lw.mlp.init(cfg.hidden_size, cfg.intermediate_size, device_index);
         lw.attn.init(cfg.hidden_size,
                      cfg.num_attention_heads,
@@ -173,67 +148,92 @@ QwenModel::QwenModel(const ModelConfig& cfg, int device_index)
 QwenModel::~QwenModel() = default;
 
 void QwenModel::load_weights(const WeightIndex& idx) {
-    
     const int64_t H   = cfg_.hidden_size;
     const int64_t I   = cfg_.intermediate_size;
     const int64_t Hq  = cfg_.num_attention_heads * cfg_.head_dim();
     const int64_t Hkv = cfg_.num_key_value_heads * cfg_.kv_head_dim();
 
+    const WeightNameMapper mapper(cfg_.arch);
+
     for (int64_t i = 0; i < cfg_.num_hidden_layers; ++i) {
-        const std::string p = "model.layers." + std::to_string(i) + ".";
+        const LayerWeightNames n = mapper.names_for_layer(i);
 
-        
         layers_[i].input_layernorm.set_weight(
-            upload_as_f16(idx, p + "input_layernorm.weight", device_index_));
-        
-        layers_[i].post_attn_layernorm.set_weight(
-            upload_as_f16(idx, p + "post_attention_layernorm.weight", device_index_));
+            WeightNameMapper::load_weight_as_f16(idx, n.input_layernorm,
+                                                 device_index_));
 
-        
-        Tensor wg = upload_as_f16(idx, p + "mlp.gate_proj.weight", device_index_);
-        Tensor wu = upload_as_f16(idx, p + "mlp.up_proj.weight",   device_index_);
-        Tensor wd = upload_as_f16(idx, p + "mlp.down_proj.weight", device_index_);
-        
-        std::fprintf(stderr, "Layer %ld MLP shapes: wg=[%ld,%ld] wu=[%ld,%ld] wd=[%ld,%ld] expected=[%ld,%ld]\n",
-                     i, wg.shape()[0], wg.shape()[1], wu.shape()[0], wu.shape()[1],
-                     wd.shape()[0], wd.shape()[1], cfg_.intermediate_size, cfg_.hidden_size);
-        
+        layers_[i].post_attn_layernorm.set_weight(
+            WeightNameMapper::load_weight_as_f16(idx, n.post_attn_layernorm,
+                                                 device_index_));
+
+        // MLP: same shape for both archs, but we go through the mapper for
+        // the names so future per-arch renames land in one place.
+        Tensor wg = WeightNameMapper::load_weight_as_f16(idx, n.gate_proj,
+                                                         device_index_);
+        Tensor wu = WeightNameMapper::load_weight_as_f16(idx, n.up_proj,
+                                                         device_index_);
+        Tensor wd = WeightNameMapper::load_weight_as_f16(idx, n.down_proj,
+                                                         device_index_);
+
+        std::fprintf(stderr,
+                     "Layer %ld MLP shapes: wg=[%ld,%ld] wu=[%ld,%ld] wd=[%ld,%ld] expected=[%ld,%ld]\n",
+                     i, wg.shape()[0], wg.shape()[1],
+                        wu.shape()[0], wu.shape()[1],
+                        wd.shape()[0], wd.shape()[1],
+                     cfg_.intermediate_size, cfg_.hidden_size);
+
         layers_[i].mlp.set_weights(wg, wu, wd);
 
-        
-        Tensor wq = upload_as_f16(idx, p + "self_attn.q_proj.weight", device_index_);
-        Tensor wk = upload_as_f16(idx, p + "self_attn.k_proj.weight", device_index_);
-        Tensor wv = upload_as_f16(idx, p + "self_attn.v_proj.weight", device_index_);
-        Tensor wo = upload_as_f16(idx, p + "self_attn.o_proj.weight", device_index_);
-        Tensor bq, bk, bv;
-        const bool has_bias = (idx.find(p + "self_attn.q_proj.bias") != nullptr);
-        if (has_bias) {
-            bq = upload_as_f16(idx, p + "self_attn.q_proj.bias", device_index_);
-            bk = upload_as_f16(idx, p + "self_attn.k_proj.bias", device_index_);
-            bv = upload_as_f16(idx, p + "self_attn.v_proj.bias", device_index_);
-        }
-        layers_[i].attn.set_weights(wq, wk, wv, wo, bq, bk, bv);
+        // Attention projections. The mapper handles the per-arch split
+        // (Gemma merges QKV into a single weight that we slice).
+        auto qkv = mapper.load_qkv(idx, n,
+                                    cfg_.num_attention_heads,
+                                    cfg_.num_key_value_heads,
+                                    cfg_.head_dim(), H, device_index_);
 
-        require_shape(wq, {Hq,  H},   p + "q_proj.weight");
-        require_shape(wk, {Hkv, H},   p + "k_proj.weight");
-        require_shape(wv, {Hkv, H},   p + "v_proj.weight");
-        require_shape(wo, {H,   Hq},  p + "o_proj.weight");
-        if (has_bias) {
-            require_shape(bq, {Hq},  p + "q_proj.bias");
-            require_shape(bk, {Hkv}, p + "k_proj.bias");
-            require_shape(bv, {Hkv}, p + "v_proj.bias");
+        Tensor wo = WeightNameMapper::load_weight_as_f16(idx, n.o_proj,
+                                                         device_index_);
+        require_shape(wo, {H, Hq}, n.o_proj);
+
+        // Bias is only present for Qwen-style models (Qwen2/2.5); other
+        // QwenLLaMA archs (LLaMA 2/3, Mistral, Yi, DeepSeek, ...) and Gemma
+        // have no QKV bias.
+        Tensor bq, bk, bv;
+        bool has_bias = false;
+        if (cfg_.arch == ModelArch::QwenLLaMA && cfg_.has_qkv_bias) {
+            // Even within Qwen family, double-check the safetensors have it
+            // (some checkpoints strip bias).
+            if (idx.find(n.q_proj_bias) != nullptr) {
+                has_bias = true;
+                bq = WeightNameMapper::load_weight_as_f16(idx, n.q_proj_bias,
+                                                          device_index_);
+                bk = WeightNameMapper::load_weight_as_f16(idx, n.k_proj_bias,
+                                                          device_index_);
+                bv = WeightNameMapper::load_weight_as_f16(idx, n.v_proj_bias,
+                                                          device_index_);
+                require_shape(bq, {Hq},  n.q_proj_bias);
+                require_shape(bk, {Hkv}, n.k_proj_bias);
+                require_shape(bv, {Hkv}, n.v_proj_bias);
+            }
         }
+
+        layers_[i].attn.set_weights(qkv.w_q, qkv.w_k, qkv.w_v,
+                                    wo, bq, bk, bv);
     }
 
-    embed_ = upload_as_f16(idx, "model.embed_tokens.weight", device_index_);
-    require_shape(embed_, {cfg_.vocab_size, H}, "model.embed_tokens.weight");
+    embed_ = WeightNameMapper::load_weight_as_f16(idx, mapper.embed_tokens(),
+                                                  device_index_);
+    require_shape(embed_, {cfg_.vocab_size, H}, mapper.embed_tokens());
     if (cfg_.tie_word_embeddings) {
         lm_head_ = embed_;
     } else {
-        lm_head_ = upload_as_f16(idx, "lm_head.weight", device_index_);
-        require_shape(lm_head_, {cfg_.vocab_size, H}, "lm_head.weight");
+        lm_head_ = WeightNameMapper::load_weight_as_f16(idx, mapper.lm_head(),
+                                                       device_index_);
+        require_shape(lm_head_, {cfg_.vocab_size, H}, mapper.lm_head());
     }
-    final_norm_.set_weight(upload_as_f16(idx, "model.norm.weight", device_index_));
+    final_norm_.set_weight(
+        WeightNameMapper::load_weight_as_f16(idx, mapper.model_norm(),
+                                             device_index_));
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +264,16 @@ Tensor QwenModel::forward(const Tensor& token_ids,
         static_cast<const int64_t*>(token_ids.data()),
         static_cast<const __half*>(embed_.data()),
         static_cast<__half*>(hidden.data()), B, S, H, /*stream=*/0);
+
+    // Gemma scales the embedding output by sqrt(hidden_size). For other
+    // archs this is a no-op (scale = 1).
+    if (cfg_.embed_scale) {
+        const float scale = std::sqrt(static_cast<float>(H));
+        kernels::launch_scale_inplace(static_cast<__half*>(hidden.data()),
+                                      scale,
+                                      static_cast<int64_t>(B) * S * H,
+                                      /*stream=*/0);
+    }
     
     // debug_print_tensor("embeddings", hidden);
 
@@ -426,6 +436,14 @@ Tensor QwenModel::forward_paged_batched(const Tensor& token_ids,
         static_cast<const __half*>(embed_.data()),
         static_cast<__half*>(hidden.data()), B, S, H, /*stream=*/0);
 
+    if (cfg_.embed_scale) {
+        const float scale = std::sqrt(static_cast<float>(H));
+        kernels::launch_scale_inplace(static_cast<__half*>(hidden.data()),
+                                      scale,
+                                      static_cast<int64_t>(B) * S * H,
+                                      /*stream=*/0);
+    }
+
     residual_buf_ = Tensor::empty({B, S, H}, DType::FP16, Device::cuda(device_index_));
     normed_buf_   = Tensor::empty({B, S, H}, DType::FP16, Device::cuda(device_index_));
 
@@ -520,6 +538,14 @@ Tensor QwenModel::forward_paged(const Tensor& token_ids,
         static_cast<const int64_t*>(token_ids.data()),
         static_cast<const __half*>(embed_.data()),
         static_cast<__half*>(hidden.data()), B, S, H, /*stream=*/0);
+
+    if (cfg_.embed_scale) {
+        const float scale = std::sqrt(static_cast<float>(H));
+        kernels::launch_scale_inplace(static_cast<__half*>(hidden.data()),
+                                      scale,
+                                      static_cast<int64_t>(B) * S * H,
+                                      /*stream=*/0);
+    }
 
     residual_buf_ = Tensor::empty({B, S, H}, DType::FP16, Device::cuda(device_index_));
     normed_buf_   = Tensor::empty({B, S, H}, DType::FP16, Device::cuda(device_index_));
