@@ -137,8 +137,17 @@ TransformerModel::TransformerModel(const ModelConfig& cfg, int device_index)
                                                 device_index, cfg.rmsnorm_add_one);
         lw.post_feedforward_layernorm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps,
                                                 device_index, cfg.rmsnorm_add_one);
-        lw.mlp.init(cfg.hidden_size, cfg.intermediate_size, device_index,
-                    cfg.mlp_act);
+        // MoE vs dense MLP
+        if (cfg.is_moe()) {
+            lw.use_moe = true;
+            lw.moe.init(cfg.hidden_size, cfg.moe_intermediate_size,
+                       cfg.num_experts, cfg.num_experts_per_tok,
+                       device_index, cfg.mlp_act);
+        } else {
+            lw.use_moe = false;
+            lw.mlp.init(cfg.hidden_size, cfg.intermediate_size, device_index,
+                       cfg.mlp_act);
+        }
         lw.attn.init(cfg.hidden_size,
                      cfg.num_attention_heads,
                      cfg.num_key_value_heads,
@@ -208,16 +217,39 @@ void TransformerModel::load_weights(const WeightIndex& idx) {
             }
         }
 
-        // MLP: same shape for both archs, but we go through the mapper for
-        // the names so future per-arch renames land in one place.
-        Tensor wg = WeightNameMapper::load_weight_as_f16(idx, n.gate_proj,
-                                                         device_index_);
-        Tensor wu = WeightNameMapper::load_weight_as_f16(idx, n.up_proj,
-                                                         device_index_);
-        Tensor wd = WeightNameMapper::load_weight_as_f16(idx, n.down_proj,
-                                                         device_index_);
+        // MLP or MoE: dense models use gate/up/down projections;
+        // MoE models use router gate + per-expert MLPs.
+        if (cfg_.is_moe()) {
+            // MoE: load router gate and expert weights
+            std::string moe_prefix = "model.layers." + std::to_string(i) +
+                                     ".block_sparse_moe.";
+            std::string gate_name = moe_prefix + "gate.weight";
+            Tensor router_gate = WeightNameMapper::load_weight_as_f16(
+                idx, gate_name, device_index_);
+            layers_[i].moe.set_router_gate(router_gate);
 
-        layers_[i].mlp.set_weights(wg, wu, wd);
+            for (int64_t e = 0; e < cfg_.num_experts; ++e) {
+                std::string expert_prefix = moe_prefix + "experts." +
+                                           std::to_string(e) + ".";
+                Tensor wg = WeightNameMapper::load_weight_as_f16(
+                    idx, expert_prefix + "w1.weight", device_index_);
+                Tensor wu = WeightNameMapper::load_weight_as_f16(
+                    idx, expert_prefix + "w3.weight", device_index_);
+                Tensor wd = WeightNameMapper::load_weight_as_f16(
+                    idx, expert_prefix + "w2.weight", device_index_);
+                layers_[i].moe.set_expert_weights(e, wg, wu, wd);
+            }
+        } else {
+            // Dense MLP: same shape for both archs, but we go through the
+            // mapper for the names so future per-arch renames land in one place.
+            Tensor wg = WeightNameMapper::load_weight_as_f16(idx, n.gate_proj,
+                                                             device_index_);
+            Tensor wu = WeightNameMapper::load_weight_as_f16(idx, n.up_proj,
+                                                             device_index_);
+            Tensor wd = WeightNameMapper::load_weight_as_f16(idx, n.down_proj,
+                                                             device_index_);
+            layers_[i].mlp.set_weights(wg, wu, wd);
+        }
 
         // Attention projections. The mapper handles the per-arch split
         // (Gemma merges QKV into a single weight that we slice).
@@ -378,7 +410,9 @@ Tensor TransformerModel::forward(const Tensor& token_ids,
                        static_cast<int64_t>(B) * S * H * sizeof(__half),
                        cudaMemcpyDeviceToDevice);
             Tensor pre_normed_2d = layers_[i].pre_feedforward_layernorm.forward(hidden_2d);
-            Tensor mlp_out_2d = layers_[i].mlp.forward(pre_normed_2d);
+            Tensor mlp_out_2d = layers_[i].use_moe
+                ? layers_[i].moe.forward(pre_normed_2d)
+                : layers_[i].mlp.forward(pre_normed_2d);
             Tensor mlp_out_normed_2d = layers_[i].post_feedforward_layernorm.forward(mlp_out_2d);
             Tensor mlp_out_normed({B, S, H}, DType::FP16,
                                   Device::cuda(device_index_));
@@ -394,7 +428,9 @@ Tensor TransformerModel::forward(const Tensor& token_ids,
                        static_cast<int64_t>(B) * S * H * sizeof(__half),
                        cudaMemcpyDeviceToDevice);
             Tensor normed_2d_mlp = layers_[i].post_attn_layernorm.forward(hidden_2d);
-            Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d_mlp);
+            Tensor mlp_out_2d = layers_[i].use_moe
+                ? layers_[i].moe.forward(normed_2d_mlp)
+                : layers_[i].mlp.forward(normed_2d_mlp);
             kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
                 static_cast<const __half*>(mlp_out_2d.data()),
                 static_cast<int64_t>(B) * S * H, /*stream=*/0);
@@ -529,7 +565,9 @@ Tensor TransformerModel::forward_paged_batched(const Tensor& token_ids,
                        static_cast<int64_t>(B) * S * H * sizeof(__half),
                        cudaMemcpyDeviceToDevice);
             Tensor pre_normed_2d = layers_[i].pre_feedforward_layernorm.forward(hidden_2d);
-            Tensor mlp_out_2d = layers_[i].mlp.forward(pre_normed_2d);
+            Tensor mlp_out_2d = layers_[i].use_moe
+                ? layers_[i].moe.forward(pre_normed_2d)
+                : layers_[i].mlp.forward(pre_normed_2d);
             Tensor mlp_out_normed_2d = layers_[i].post_feedforward_layernorm.forward(mlp_out_2d);
             Tensor mlp_out_normed({B, S, H}, DType::FP16,
                                   Device::cuda(device_index_));
@@ -544,7 +582,9 @@ Tensor TransformerModel::forward_paged_batched(const Tensor& token_ids,
                        static_cast<int64_t>(B) * S * H * sizeof(__half),
                        cudaMemcpyDeviceToDevice);
             normed_2d = layers_[i].post_attn_layernorm.forward(hidden_2d);
-            Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d);
+            Tensor mlp_out_2d = layers_[i].use_moe
+                ? layers_[i].moe.forward(normed_2d)
+                : layers_[i].mlp.forward(normed_2d);
             kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
                 static_cast<const __half*>(mlp_out_2d.data()),
                 static_cast<int64_t>(B) * S * H, /*stream=*/0);
@@ -663,7 +703,9 @@ Tensor TransformerModel::forward_paged(const Tensor& token_ids,
                        static_cast<int64_t>(B) * S * H * sizeof(__half),
                        cudaMemcpyDeviceToDevice);
             Tensor pre_normed_2d = layers_[i].pre_feedforward_layernorm.forward(hidden_2d);
-            Tensor mlp_out_2d = layers_[i].mlp.forward(pre_normed_2d);
+            Tensor mlp_out_2d = layers_[i].use_moe
+                ? layers_[i].moe.forward(pre_normed_2d)
+                : layers_[i].mlp.forward(pre_normed_2d);
             Tensor mlp_out_normed_2d = layers_[i].post_feedforward_layernorm.forward(mlp_out_2d);
             Tensor mlp_out_normed({B, S, H}, DType::FP16,
                                   Device::cuda(device_index_));
@@ -679,7 +721,9 @@ Tensor TransformerModel::forward_paged(const Tensor& token_ids,
                        static_cast<int64_t>(B) * S * H * sizeof(__half),
                        cudaMemcpyDeviceToDevice);
             normed_2d = layers_[i].post_attn_layernorm.forward(hidden_2d);
-            Tensor mlp_out_2d = layers_[i].mlp.forward(normed_2d);
+            Tensor mlp_out_2d = layers_[i].use_moe
+                ? layers_[i].moe.forward(normed_2d)
+                : layers_[i].mlp.forward(normed_2d);
             kernels::launch_add_inplace(static_cast<__half*>(hidden.data()),
                 static_cast<const __half*>(mlp_out_2d.data()),
                 static_cast<int64_t>(B) * S * H, /*stream=*/0);

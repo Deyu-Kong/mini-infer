@@ -7,14 +7,19 @@ field names and safetensors weight names. The core components (RMSNorm, RoPE,
 SwiGLU, GQA) are already generic — the bottleneck is **config parsing** and
 **weight name mapping**.
 
-As of mid-2026, Phase 1 (LLaMA family), Phase 2 (Gemma 1/2/3), and
-Phase 3 (Architecture Abstraction) are implemented. `ModelConfig` carries
-a `ModelArch` enum (`QwenLLaMA`, `Gemma`, `GPT2`, `Bloom`) selected from
-`model_type`; `WeightNameMapper` returns per-layer HF weight names per arch;
-RMSNorm has an `add_one_` flag for Gemma; `TransformerModel::forward`
+As of mid-2026, all four phases are implemented:
+
+- **Phase 1** (LLaMA family): LLaMA 2/3, Mistral, Yi, DeepSeek support
+- **Phase 2** (Gemma 1/2/3): GeGLU, 4-norm block, Q/K RMSNorm, sliding window, dual RoPE
+- **Phase 3** (Architecture Abstraction): `QwenModel` → `TransformerModel`, `ArchRegistry`
+- **Phase 4** (MoE Support): Mixtral / DeepSeek-MoE / Qwen2-MoE via `MoELayer`
+
+`ModelConfig` carries a `ModelArch` enum (`QwenLLaMA`, `Gemma`, `GPT2`, `Bloom`)
+selected from `model_type`; `WeightNameMapper` returns per-layer HF weight names
+per arch; RMSNorm has an `add_one_` flag for Gemma; `TransformerModel::forward`
 scales embeddings by `sqrt(hidden_size)` for Gemma. `ArchRegistry` provides
-per-arch traits (norm type, position encoding, activation, bias).
-The former `QwenModel` has been renamed to `TransformerModel`.
+per-arch traits (norm type, position encoding, activation, bias). MoE models
+use `MoELayer` with fused top-K routing + per-expert MLP dispatch.
 
 ## Phase 1: LLaMA Family (DONE)
 
@@ -139,22 +144,36 @@ enum class ModelArch {
 - `src/core/main.cc` — same rename
 - `CMakeLists.txt` — updated source file name
 
-## Phase 4: MoE Support (3-5 days, optional)
+## Phase 4: MoE Support (DONE)
 
-Mixtral / DeepSeek-MoE / Qwen2-MoE require:
+Mixtral / DeepSeek-MoE / Qwen2-MoE support implemented.
 
-- New `MoELayer` class: router gate + top-K expert selection + weighted sum
-- `TransformerModel` selects dense MLP or MoE based on arch
+### What's done
+
+- `ModelConfig` extended with MoE fields: `num_experts`, `num_experts_per_tok`,
+  `moe_intermediate_size`. Parses both `num_experts` (Qwen2-MoE) and
+  `num_local_experts` (Mixtral) from config.json. `is_moe()` helper returns
+  true when MoE is enabled.
+- `MoELayer` class (`src/layers/moe.h/cpp`): owns N expert MLPs + router gate.
+  Forward: router GEMM → fused top-K + softmax CUDA kernel → per-expert MLP
+  → weighted scatter-add accumulation.
+- `moe_kernel.cu`: fused top-K expert selection with softmax weighting,
+  plus scatter-add kernel for accumulating expert outputs.
+- `TransformerModel` dispatches to `MoELayer` or `MLP` per-layer based on
+  `LayerWeights::use_moe` flag. Weight loading reads Mixtral-style
+  `block_sparse_moe.gate.weight` + `block_sparse_moe.experts.{j}.w{1,2,3}.weight`.
 
 ### New files
 
 - `src/layers/moe.h/cpp` — MoE layer implementation
 - `src/kernels/moe_kernel.cu` — fused top-K gate + expert dispatch kernel
+- `src/kernels/moe_kernel.cuh` — kernel declarations
 
-### Files to modify
+### Files modified
 
-- `src/model/transformer_model.cpp` — MoE layer dispatch
-- `src/model/model_config.h` — MoE config fields (`num_experts`, `num_experts_per_tok`)
+- `src/model/transformer_model.h/cpp` — MoE layer dispatch in forward + weight loading
+- `src/model/model_config.h/cpp` — MoE config fields and parsing
+- `CMakeLists.txt` — added moe.cpp and moe_kernel.cu
 
 ## Priority
 
@@ -163,6 +182,6 @@ Mixtral / DeepSeek-MoE / Qwen2-MoE require:
 | 1 | 1-2 days | LLaMA 2/3, Mistral, Yi, DeepSeek | **Do first** |
 | 2 | half day | Gemma 1/2/3 | Do alongside Phase 1 |
 | 3 | 2-3 days | Architecture-level refactor | **Done** |
-| 4 | 3-5 days | Mixtral, DeepSeek-MoE | Nice to have |
+| 4 | 3-5 days | Mixtral, DeepSeek-MoE | **Done** |
 
 Phase 1 alone covers 70%+ of mainstream open-source models.

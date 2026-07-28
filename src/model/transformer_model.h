@@ -11,6 +11,7 @@
 #include "core/tensor.h"
 #include "layers/attention.h"
 #include "layers/mlp.h"
+#include "layers/moe.h"
 #include "layers/rmsnorm.h"
 #include "model/arch_registry.h"
 #include "model/model_config.h"
@@ -46,8 +47,10 @@ struct LayerWeights {
     RMSNorm          pre_feedforward_layernorm;   // Gemma 2/3 only
     RMSNorm          post_feedforward_layernorm;  // Gemma 2/3 only
     MLP              mlp;
+    MoELayer         moe;                         // MoE models only
     Attention        attn;
     bool             is_sliding = false;          // Gemma 2/3 sliding layer
+    bool             use_moe = false;             // true = use moe, false = use mlp
 
     LayerWeights() = default;
     LayerWeights(const LayerWeights&) = delete;

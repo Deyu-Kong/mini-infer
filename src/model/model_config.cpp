@@ -91,6 +91,20 @@ ModelConfig ModelConfig::load(const std::string& path) {
 
     c.mlp_act = act_from_string(c.hidden_act);
 
+    // ---- MoE fields ----------------------------------------------------
+    c.num_experts = jget_int(j, "num_experts", 0);
+    c.num_experts_per_tok = jget_int(j, "num_experts_per_tok", 0);
+    c.moe_intermediate_size = jget_int(j, "moe_intermediate_size", 0);
+    // Mixtral uses "num_local_experts" and "num_experts_per_tok"
+    if (c.num_experts == 0) {
+        c.num_experts = jget_int(j, "num_local_experts", 0);
+    }
+    // Fallback: if MoE is enabled but moe_intermediate_size is not set,
+    // use the dense intermediate_size (some configs do this).
+    if (c.num_experts > 0 && c.moe_intermediate_size == 0) {
+        c.moe_intermediate_size = c.intermediate_size;
+    }
+
     // ---- arch-specific overrides --------------------------------------
     c.arch = arch_from_model_type(c.model_type);
     if (c.arch == ModelArch::Gemma) {

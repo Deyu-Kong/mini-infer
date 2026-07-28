@@ -93,6 +93,12 @@ struct ModelConfig {
     bool      dual_rope           = false;
     float     local_rope_theta    = 10000.0f;
 
+    // MoE (Mixture of Experts) — Mixtral, DeepSeek-MoE, Qwen2-MoE.
+    // When num_experts > 0, the MLP is replaced by a sparse MoE layer.
+    int64_t   num_experts         = 0;          // 0 = dense MLP
+    int64_t   num_experts_per_tok = 0;          // top-K experts per token
+    int64_t   moe_intermediate_size = 0;        // per-expert intermediate size
+
     // -------- derived --------
     int64_t head_dim() const {
         if (head_dim_override > 0) return head_dim_override;
@@ -104,6 +110,9 @@ struct ModelConfig {
     int64_t num_kv_groups() const {
         return num_attention_heads / num_key_value_heads;
     }
+
+    // True iff this model uses MoE (sparse MLP) layers.
+    bool is_moe() const { return num_experts > 0 && num_experts_per_tok > 0; }
 
     // True iff this layer should run with sliding (local) attention.
     // For LLaMA/Mistral/Qwen/Yi/DeepSeek/Gemma-1/Gemma-2: always false.

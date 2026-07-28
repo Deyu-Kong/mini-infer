@@ -106,6 +106,7 @@ add_library(mini_infer_kernels STATIC
     src/kernels/sampling_kernel.cu
     src/kernels/model_utils_kernel.cu
     src/kernels/paged_attn_kernel.cu
+    src/kernels/moe_kernel.cu
 )
 target_include_directories(mini_infer_kernels
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -123,6 +124,7 @@ target_compile_options(mini_infer_kernels PRIVATE
 # -----------------------------------------------------------------------------
 add_library(mini_infer_layers STATIC
     src/layers/mlp.cpp
+    src/layers/moe.cpp
     src/layers/rmsnorm.cpp
     src/layers/rope.cpp
     src/layers/attention.cpp
