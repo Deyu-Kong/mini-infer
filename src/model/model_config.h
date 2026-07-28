@@ -22,6 +22,8 @@ namespace mini_infer {
 enum class ModelArch {
     QwenLLaMA = 0,   // Qwen2/2.5 + LLaMA-family decoders (Mistral, Yi, etc.)
     Gemma,           // Gemma 1/2/3
+    GPT2,            // GPT-2, GPT-Neo (future)
+    Bloom,           // Bloom (future)
 };
 
 /**

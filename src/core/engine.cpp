@@ -26,7 +26,7 @@ void cuda_check_(cudaError_t e, const char* expr, const char* file, int line) {
 #define MI_CHECK_CUDA(expr) cuda_check_((expr), #expr, __FILE__, __LINE__)
 }  // namespace
 
-Engine::Engine(std::shared_ptr<QwenModel> model, int64_t max_seq_len,
+Engine::Engine(std::shared_ptr<TransformerModel> model, int64_t max_seq_len,
                int device_index,
                int paged_num_blocks_override)
     : model_(model), device_index_(device_index), max_seq_len_(max_seq_len) {
@@ -228,7 +228,7 @@ std::vector<int64_t> Engine::generate(const std::vector<int64_t>& prompt_ids,
 // Paged generation (Week 5).
 //
 // Same shape as `generate`, but K/V live in PagedKVCache and the kernel
-// path goes through `QwenModel::forward_paged`.
+// path goes through `TransformerModel::forward_paged`.
 // ---------------------------------------------------------------------------
 std::vector<int64_t> Engine::generate_paged(
     const std::vector<int64_t>& prompt_ids,

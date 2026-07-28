@@ -140,11 +140,11 @@ target_link_libraries(mini_infer_layers
 mi_force_cuda(mini_infer_layers src/layers/mlp.cpp)
 
 # -----------------------------------------------------------------------------
-# mini_infer_model library: safetensors loader, QwenModel
+# mini_infer_model library: safetensors loader, TransformerModel
 # -----------------------------------------------------------------------------
 add_library(mini_infer_model STATIC
     src/model/safetensors_loader.cpp
-    src/model/qwen_model.cpp
+    src/model/transformer_model.cpp
     src/model/weight_mapper.cpp
 )
 target_include_directories(mini_infer_model

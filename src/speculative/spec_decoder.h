@@ -5,7 +5,7 @@
 #include <vector>
 
 #include "core/tensor.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "scheduler/kv_cache.h"
 #include "speculative/draft_engine.h"
 
@@ -24,7 +24,7 @@ struct SpecDecodeStats {
 
 class SpecDecoder {
 public:
-    SpecDecoder(std::shared_ptr<QwenModel> target_model,
+    SpecDecoder(std::shared_ptr<TransformerModel> target_model,
                 std::shared_ptr<DraftEngine> draft_engine,
                 int64_t max_seq_len,
                 int gamma = 4,
@@ -58,7 +58,7 @@ private:
 
     int64_t sample_from_logits_(const Tensor& logits);
 
-    std::shared_ptr<QwenModel> target_model_;
+    std::shared_ptr<TransformerModel> target_model_;
     std::shared_ptr<DraftEngine> draft_engine_;
     int64_t max_seq_len_;
     int gamma_;

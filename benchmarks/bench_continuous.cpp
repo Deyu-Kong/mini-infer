@@ -34,7 +34,7 @@
 #include "core/engine.h"
 #include "core/tokenizer.h"
 #include "model/model_config.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "model/safetensors_loader.h"
 #include "scheduler/paged_kv_cache.h"
 #include "scheduler/request.h"
@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     }
     auto cfg = ModelConfig::load(args.model_dir + "/config.json");
     auto idx = WeightIndex::load(args.model_dir);
-    auto model = std::make_shared<QwenModel>(cfg, args.device);
+    auto model = std::make_shared<TransformerModel>(cfg, args.device);
     model->load_weights(idx);
     Tokenizer tok(args.model_dir + "/tokenizer.json",
                   "/data1/kdy/anaconda3/envs/vllm/bin/python");

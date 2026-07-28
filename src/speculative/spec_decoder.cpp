@@ -98,7 +98,7 @@ Tensor extract_row(const Tensor& logits, int row, int device_index) {
 }
 }  // namespace
 
-SpecDecoder::SpecDecoder(std::shared_ptr<QwenModel> target_model,
+SpecDecoder::SpecDecoder(std::shared_ptr<TransformerModel> target_model,
                          std::shared_ptr<DraftEngine> draft_engine,
                          int64_t max_seq_len, int gamma, int device_index)
     : target_model_(target_model),

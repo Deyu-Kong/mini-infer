@@ -24,7 +24,7 @@ void cuda_check_d(cudaError_t e, const char* expr, const char* file, int line) {
 #define MI_CHECK_CUDA_D(expr) cuda_check_d((expr), #expr, __FILE__, __LINE__)
 }  // namespace
 
-DraftEngine::DraftEngine(std::shared_ptr<QwenModel> model,
+DraftEngine::DraftEngine(std::shared_ptr<TransformerModel> model,
                          int64_t max_seq_len, int device_index)
     : model_(model), device_index_(device_index), max_seq_len_(max_seq_len) {
     if (!model_) throw std::runtime_error("DraftEngine: model is null");

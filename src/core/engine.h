@@ -6,7 +6,7 @@
 #include <vector>
 
 #include "core/tensor.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "scheduler/kv_cache.h"
 #include "scheduler/paged_kv_cache.h"
 
@@ -21,7 +21,7 @@ enum class SamplingMode {
 };
 
 /**
- * Engine — orchestrates the autoregressive decode loop on top of QwenModel.
+ * Engine — orchestrates the autoregressive decode loop on top of TransformerModel.
  *
  *   1. Prefill : run the entire prompt in one forward pass.
  *   2. Decode  : for each new token, run a 1-token forward pass and sample.
@@ -36,7 +36,7 @@ enum class SamplingMode {
  */
 class Engine {
 public:
-    Engine(std::shared_ptr<QwenModel> model, int64_t max_seq_len,
+    Engine(std::shared_ptr<TransformerModel> model, int64_t max_seq_len,
            int device_index = 0,
            int paged_num_blocks_override = 0);
     ~Engine();
@@ -99,7 +99,7 @@ public:
 private:
     Tensor sample_logits_(const Tensor& logits, int vocab_offset = 0);
 
-    std::shared_ptr<QwenModel> model_;
+    std::shared_ptr<TransformerModel> model_;
     int device_index_;
     int64_t max_seq_len_;
     std::unique_ptr<KVCache> kv_cache_;

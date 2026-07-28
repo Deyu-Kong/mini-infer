@@ -24,7 +24,7 @@
 #include "core/engine.h"
 #include "core/tokenizer.h"
 #include "model/model_config.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "model/safetensors_loader.h"
 
 using namespace mini_infer;
@@ -59,7 +59,7 @@ int main(int argc, char** argv) {
     // 1) Load model.
     auto cfg = ModelConfig::load(model_dir + "/config.json");
     auto idx = WeightIndex::load(model_dir);
-    auto model = std::make_shared<QwenModel>(cfg, gpu);
+    auto model = std::make_shared<TransformerModel>(cfg, gpu);
     model->load_weights(idx);
     Engine engine(model, max_seq_len, gpu);
     engine.set_sampling(SamplingMode::Greedy);

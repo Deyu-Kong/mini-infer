@@ -7,7 +7,7 @@
 #include <cuda_fp16.h>
 
 #include "core/tensor.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "scheduler/kv_cache.h"
 
 namespace mini_infer {
@@ -19,7 +19,7 @@ struct DraftToken {
 
 class DraftEngine {
 public:
-    DraftEngine(std::shared_ptr<QwenModel> model, int64_t max_seq_len,
+    DraftEngine(std::shared_ptr<TransformerModel> model, int64_t max_seq_len,
                 int device_index = 0);
     ~DraftEngine();
 
@@ -47,7 +47,7 @@ public:
 private:
     DraftToken sample_one_(const Tensor& logits);
 
-    std::shared_ptr<QwenModel> model_;
+    std::shared_ptr<TransformerModel> model_;
     int device_index_;
     int64_t max_seq_len_;
     int64_t cur_len_ = 0;

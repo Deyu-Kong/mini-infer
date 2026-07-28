@@ -9,7 +9,7 @@
 #include <vector>
 
 #include "core/tensor.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "scheduler/paged_kv_cache.h"
 #include "scheduler/prefix_cache.h"
 #include "scheduler/request.h"
@@ -100,7 +100,7 @@ struct IterationStats {
  */
 class Scheduler {
 public:
-    Scheduler(std::shared_ptr<QwenModel> model,
+    Scheduler(std::shared_ptr<TransformerModel> model,
               std::shared_ptr<PagedKVCache> paged_kv,
               SchedulerConfig cfg = SchedulerConfig{},
               int device_index = 0);
@@ -159,7 +159,7 @@ private:
     // Assign a fresh paged sequence id, register with PagedKVCache.
     int allocate_seq_id_();
 
-    std::shared_ptr<QwenModel>    model_;
+    std::shared_ptr<TransformerModel>    model_;
     std::shared_ptr<PagedKVCache> paged_kv_;
     SchedulerConfig               cfg_;
     int                           device_index_;

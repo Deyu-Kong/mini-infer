@@ -12,6 +12,7 @@
 #include "layers/attention.h"
 #include "layers/mlp.h"
 #include "layers/rmsnorm.h"
+#include "model/arch_registry.h"
 #include "model/model_config.h"
 #include "model/safetensors_loader.h"
 
@@ -36,7 +37,7 @@ namespace mini_infer {
  *     `pre_feedforward_layernorm` and `post_feedforward_layernorm` are
  *     only populated for Gemma 2/3.
  *
- * All components are constructed empty; `QwenModel::load_weights` fills
+ * All components are constructed empty; `TransformerModel::load_weights` fills
  * them from a WeightIndex. Each component owns its own device buffers.
  */
 struct LayerWeights {
@@ -56,14 +57,15 @@ struct LayerWeights {
 };
 
 /**
- * QwenModel — Qwen2.5 / LLaMA-style decoder, also covering the LLaMA
- * family (LLaMA 2/3/3.1, Mistral, Yi, DeepSeek, ...) and Gemma 1/2/3.
+ * TransformerModel — generic causal-decoder model covering Qwen2/2.5,
+ * LLaMA 2/3/3.1, Mistral, Yi, DeepSeek, and Gemma 1/2/3.
  *
  * Loads weights from a HuggingFace safetensors index and owns the
  * per-layer components. `forward(...)` runs a prefill or decode step and
  * returns logits; `Engine::generate` wraps this in an autoregressive loop.
  *
- * Per-arch behaviour is driven by `ModelConfig::arch` (see model_config.h):
+ * Per-arch behaviour is driven by `ModelConfig::arch` (see model_config.h)
+ * and the `ArchRegistry` (see arch_registry.h):
  *   - QwenLLaMA : RMSNorm (y = x * rrms * w), separate q/k/v_proj, optional
  *                 QKV bias (Qwen only). Embedding output is unscaled.
  *                 2-norm block. SwiGLU MLP.
@@ -73,11 +75,13 @@ struct LayerWeights {
  *   - Gemma 3   : Everything Gemma 2 has, plus Q/K RMSNorm pre-RoPE and
  *                 dual-band RoPE (global theta on global layers, local
  *                 theta on sliding layers).
+ *   - GPT2      : (future) LayerNorm, learned positional embeddings, GELU MLP.
+ *   - Bloom     : (future) LayerNorm, ALiBi position encoding, GeLU MLP.
  */
-class QwenModel {
+class TransformerModel {
 public:
-    QwenModel(const ModelConfig& cfg, int device_index = 0);
-    ~QwenModel();
+    TransformerModel(const ModelConfig& cfg, int device_index = 0);
+    ~TransformerModel();
 
     // Populate weights from a multi-shard safetensors index. Copies (not
     // aliases) onto the device so later code can munmap the source file.

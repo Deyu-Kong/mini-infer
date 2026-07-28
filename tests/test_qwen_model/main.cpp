@@ -1,5 +1,5 @@
 /**
- * test_qwen_model — exercise QwenModel::load_weights on the real
+ * test_qwen_model — exercise TransformerModel::load_weights on the real
  * Qwen2.5-Coder-7B-Instruct copy (acts as Qwen2.5-7B-Instruct since the
  * architecture is identical). Skipped if the model dir is absent.
  */
@@ -12,11 +12,11 @@
 #include <unistd.h>
 
 #include "model/model_config.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "model/safetensors_loader.h"
 
 using mini_infer::ModelConfig;
-using mini_infer::QwenModel;
+using mini_infer::TransformerModel;
 using mini_infer::WeightIndex;
 
 static int g_failures = 0;
@@ -51,9 +51,9 @@ int main() {
     EXPECT(cfg.num_hidden_layers == 28, "28 layers");
     EXPECT(cfg.num_key_value_heads == 4, "GQA: 4 kv heads");
 
-    // 2. Build QwenModel and load weights. This copies ~15 GB BF16 -> FP16
+    // 2. Build TransformerModel and load weights. This copies ~15 GB BF16 -> FP16
     //    from the mmap'd shards onto the GPU; takes ~1-2 s on A6000.
-    QwenModel model(cfg, /*device=*/0);
+    TransformerModel model(cfg, /*device=*/0);
     WeightIndex idx = WeightIndex::load(kModelDir);
     model.load_weights(idx);
     std::printf("  load_weights complete\n");

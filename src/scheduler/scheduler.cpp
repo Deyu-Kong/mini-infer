@@ -25,7 +25,7 @@ inline void cuda_check_(cudaError_t e, const char* expr, const char* f, int l) {
 #define MI_CHECK_CUDA(expr) cuda_check_((expr), #expr, __FILE__, __LINE__)
 }  // namespace
 
-Scheduler::Scheduler(std::shared_ptr<QwenModel> model,
+Scheduler::Scheduler(std::shared_ptr<TransformerModel> model,
                      std::shared_ptr<PagedKVCache> paged_kv,
                      SchedulerConfig cfg,
                      int device_index)

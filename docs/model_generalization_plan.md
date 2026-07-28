@@ -7,11 +7,14 @@ field names and safetensors weight names. The core components (RMSNorm, RoPE,
 SwiGLU, GQA) are already generic — the bottleneck is **config parsing** and
 **weight name mapping**.
 
-As of mid-2026, Phase 1 (LLaMA family) and Phase 2 (Gemma 1/2/3) are
-implemented. `ModelConfig` carries a `ModelArch` enum (`QwenLLaMA`, `Gemma`)
-selected from `model_type`; `WeightNameMapper` returns per-layer HF
-weight names per arch; RMSNorm has an `add_one_` flag for Gemma;
-`QwenModel::forward` scales embeddings by `sqrt(hidden_size)` for Gemma.
+As of mid-2026, Phase 1 (LLaMA family), Phase 2 (Gemma 1/2/3), and
+Phase 3 (Architecture Abstraction) are implemented. `ModelConfig` carries
+a `ModelArch` enum (`QwenLLaMA`, `Gemma`, `GPT2`, `Bloom`) selected from
+`model_type`; `WeightNameMapper` returns per-layer HF weight names per arch;
+RMSNorm has an `add_one_` flag for Gemma; `TransformerModel::forward`
+scales embeddings by `sqrt(hidden_size)` for Gemma. `ArchRegistry` provides
+per-arch traits (norm type, position encoding, activation, bias).
+The former `QwenModel` has been renamed to `TransformerModel`.
 
 ## Phase 1: LLaMA Family (DONE)
 
@@ -89,16 +92,16 @@ These belong to a follow-up Phase 2.5 / Phase 3 work item.
 - `src/layers/rmsnorm.h/cpp` — add `add_one_` variant
 - `src/model/qwen_model.cpp` — embedding scale for Gemma
 
-## Phase 3: Architecture Abstraction (TODO — covers Gemma 2.5 + MoE prep)
+## Phase 3: Architecture Abstraction (DONE)
 
-Rename `QwenModel` to `TransformerModel`, introduce `ModelArch` enum:
+Renamed `QwenModel` to `TransformerModel`, extended `ModelArch` enum:
 
 ```cpp
 enum class ModelArch {
-    LLaMA,    // Qwen2.5, LLaMA 2/3, Mistral, Yi, DeepSeek
-    Gemma,    // Gemma 1/2/3
-    GPT2,     // GPT-2, GPT-Neo (future)
-    Bloom,    // Bloom (future)
+    QwenLLaMA, // Qwen2/2.5, LLaMA 2/3, Mistral, Yi, DeepSeek
+    Gemma,     // Gemma 1/2/3
+    GPT2,      // GPT-2, GPT-Neo (future)
+    Bloom,     // Bloom (future)
 };
 ```
 
@@ -109,17 +112,32 @@ enum class ModelArch {
 - MLP type (SwiGLU vs GELU)
 - Attention bias
 
+### What's done
+
+- `QwenModel` renamed to `TransformerModel` across the entire codebase
+  (engine, speculative, scheduler, main, tests, benchmarks).
+- `src/model/transformer_model.h/cpp` replaces `qwen_model.h/cpp`.
+- `src/model/arch_registry.h` added: `ArchRegistry` provides per-arch
+  `ArchTraits` (norm type, position encoding, default activation, bias,
+  embedding scale, double-norm block). GPT2 and Bloom are registered as
+  future stubs.
+- `ModelArch` enum extended with `GPT2` and `Bloom` (future placeholders).
+- `TransformerModel` includes `arch_registry.h` for arch-trait queries.
+
 ### New files
 
-- `src/model/transformer_model.h/cpp` — generalized model (rename from QwenModel)
+- `src/model/transformer_model.h/cpp` — generalized model (renamed from QwenModel)
 - `src/model/arch_registry.h` — arch detection and registration
 
-### Files to modify
+### Files modified
 
-- `src/model/model_config.h/cpp` — add `ModelArch` enum and detection
-- `src/core/engine.h/cpp` — use `TransformerModel` instead of `QwenModel`
+- `src/model/model_config.h` — added `GPT2`, `Bloom` to `ModelArch`
+- `src/core/engine.h/cpp` — uses `TransformerModel`
 - `src/speculative/draft_engine.h/cpp` — same rename
+- `src/speculative/spec_decoder.h/cpp` — same rename
+- `src/scheduler/scheduler.h/cpp` — same rename
 - `src/core/main.cc` — same rename
+- `CMakeLists.txt` — updated source file name
 
 ## Phase 4: MoE Support (3-5 days, optional)
 
@@ -144,7 +162,7 @@ Mixtral / DeepSeek-MoE / Qwen2-MoE require:
 | ----- | ------ | ------------------ | -------------- |
 | 1 | 1-2 days | LLaMA 2/3, Mistral, Yi, DeepSeek | **Do first** |
 | 2 | half day | Gemma 1/2/3 | Do alongside Phase 1 |
-| 3 | 2-3 days | Architecture-level refactor | When time permits |
+| 3 | 2-3 days | Architecture-level refactor | **Done** |
 | 4 | 3-5 days | Mixtral, DeepSeek-MoE | Nice to have |
 
 Phase 1 alone covers 70%+ of mainstream open-source models.

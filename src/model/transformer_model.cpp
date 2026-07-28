@@ -1,4 +1,4 @@
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -67,7 +67,7 @@ void require_shape(const Tensor& t, const std::vector<int64_t>& want,
                    const std::string& name) {
     if (t.shape() != want) {
         std::ostringstream o;
-        o << "QwenModel: bad shape for " << name << ": got [";
+        o << "TransformerModel: bad shape for " << name << ": got [";
         for (size_t i = 0; i < t.shape().size(); ++i) {
             if (i) o << ",";
             o << t.shape()[i];
@@ -115,13 +115,13 @@ static void f16_stats(const Tensor& t, float& mean, float& stddev,
 
 }  // namespace
 
-QwenModel::QwenModel(const ModelConfig& cfg, int device_index)
+TransformerModel::TransformerModel(const ModelConfig& cfg, int device_index)
     : cfg_(cfg),
       device_index_(device_index),
       final_norm_(cfg.hidden_size, cfg.rms_norm_eps, device_index,
                   cfg.rmsnorm_add_one) {
     if (cfg.num_hidden_layers <= 0) {
-        throw std::runtime_error("QwenModel: invalid num_hidden_layers");
+        throw std::runtime_error("TransformerModel: invalid num_hidden_layers");
     }
     layers_.reserve(cfg.num_hidden_layers);
     for (int64_t i = 0; i < cfg.num_hidden_layers; ++i) {
@@ -169,9 +169,9 @@ QwenModel::QwenModel(const ModelConfig& cfg, int device_index)
                               Device::cuda(device_index));
 }
 
-QwenModel::~QwenModel() = default;
+TransformerModel::~TransformerModel() = default;
 
-void QwenModel::load_weights(const WeightIndex& idx) {
+void TransformerModel::load_weights(const WeightIndex& idx) {
     const int64_t H   = cfg_.hidden_size;
     const int64_t I   = cfg_.intermediate_size;
     const int64_t Hq  = cfg_.num_attention_heads * cfg_.head_dim();
@@ -286,23 +286,23 @@ void QwenModel::load_weights(const WeightIndex& idx) {
 // ---------------------------------------------------------------------------
 // Forward pass — runs all `num_hidden_layers` blocks + final norm + LM head.
 // ---------------------------------------------------------------------------
-Tensor QwenModel::forward(const Tensor& token_ids,
+Tensor TransformerModel::forward(const Tensor& token_ids,
                           const std::vector<int64_t>& positions,
                           std::vector<__half*>& k_ptrs,
                           std::vector<__half*>& v_ptrs,
                           int64_t max_seq,
                           int64_t cur_len, bool is_prefill) {
     if (token_ids.dtype() != DType::INT64) {
-        throw std::runtime_error("QwenModel::forward: token_ids must be int64");
+        throw std::runtime_error("TransformerModel::forward: token_ids must be int64");
     }
     if (token_ids.ndim() != 2) {
-        throw std::runtime_error("QwenModel::forward: token_ids must be 2-D");
+        throw std::runtime_error("TransformerModel::forward: token_ids must be 2-D");
     }
     const int B = static_cast<int>(token_ids.shape()[0]);
     const int S = static_cast<int>(token_ids.shape()[1]);
     const int H = static_cast<int>(cfg_.hidden_size);
     if (k_ptrs.size() != layers_.size() || v_ptrs.size() != layers_.size()) {
-        throw std::runtime_error("QwenModel::forward: kv ptrs size mismatch");
+        throw std::runtime_error("TransformerModel::forward: kv ptrs size mismatch");
     }
 
     // Embedding lookup on the GPU.
@@ -457,7 +457,7 @@ Tensor QwenModel::forward(const Tensor& token_ids,
 // ---------------------------------------------------------------------------
 // Batched paged forward (Week 5+). Same as forward_paged but for B>1.
 // ---------------------------------------------------------------------------
-Tensor QwenModel::forward_paged_batched(const Tensor& token_ids,
+Tensor TransformerModel::forward_paged_batched(const Tensor& token_ids,
                                         const std::vector<int64_t>& positions,
                                         PagedKVCache& paged_kv,
                                         const std::vector<int>& seq_ids,
@@ -590,16 +590,16 @@ Tensor QwenModel::forward_paged_batched(const Tensor& token_ids,
 // Attention::forward_paged() for every block, so K/V storage is
 // PagedKVCache-managed.
 // ---------------------------------------------------------------------------
-Tensor QwenModel::forward_paged(const Tensor& token_ids,
+Tensor TransformerModel::forward_paged(const Tensor& token_ids,
                                 const std::vector<int64_t>& positions,
                                 PagedKVCache& paged_kv,
                                 int seq_id,
                                 bool is_prefill) {
     if (token_ids.dtype() != DType::INT64) {
-        throw std::runtime_error("QwenModel::forward_paged: token_ids must be int64");
+        throw std::runtime_error("TransformerModel::forward_paged: token_ids must be int64");
     }
     if (token_ids.ndim() != 2) {
-        throw std::runtime_error("QwenModel::forward_paged: token_ids must be 2-D");
+        throw std::runtime_error("TransformerModel::forward_paged: token_ids must be 2-D");
     }
     const int B = static_cast<int>(token_ids.shape()[0]);
     const int S = static_cast<int>(token_ids.shape()[1]);

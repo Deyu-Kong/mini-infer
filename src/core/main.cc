@@ -26,7 +26,7 @@
 #include "core/engine.h"
 #include "core/tokenizer.h"
 #include "model/model_config.h"
-#include "model/qwen_model.h"
+#include "model/transformer_model.h"
 #include "model/safetensors_loader.h"
 #include "speculative/draft_engine.h"
 #include "speculative/spec_decoder.h"
@@ -112,7 +112,7 @@ int main(int argc, char** argv) {
     
     auto weight_idx = mini_infer::WeightIndex::load(args.model_dir);
     std::fprintf(stderr, "DEBUG: weight index loaded\n");
-    auto model = std::make_shared<mini_infer::QwenModel>(cfg, args.device);
+    auto model = std::make_shared<mini_infer::TransformerModel>(cfg, args.device);
     std::fprintf(stderr, "DEBUG: model created\n");
     model->load_weights(weight_idx);
     std::fprintf(stderr, "DEBUG: weights loaded\n");
@@ -173,7 +173,7 @@ int main(int argc, char** argv) {
 
         auto draft_weight_idx = mini_infer::WeightIndex::load(
             args.spec_draft_dir);
-        auto draft_model = std::make_shared<mini_infer::QwenModel>(
+        auto draft_model = std::make_shared<mini_infer::TransformerModel>(
             draft_cfg, args.device);
         draft_model->load_weights(draft_weight_idx);
 
