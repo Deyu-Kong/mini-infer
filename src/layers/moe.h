@@ -43,9 +43,16 @@ public:
     void set_expert_weights(int64_t expert_idx, const Tensor& w_gate,
                             const Tensor& w_up, const Tensor& w_down);
 
+    void set_shared_expert_weights(const Tensor& w_gate, const Tensor& w_up,
+                                    const Tensor& w_down);
+    void set_shared_expert_gate(const Tensor& w_gate);
+
     void init(int64_t hidden, int64_t moe_intermediate, int64_t num_experts,
               int64_t num_experts_per_tok, int device_index,
               ActKind act = ActKind::Silu);
+
+    void init_shared_expert(int64_t hidden, int64_t shared_intermediate,
+                            int device_index, ActKind act = ActKind::Silu);
 
     int64_t hidden() const { return hidden_; }
     int64_t moe_intermediate() const { return moe_intermediate_; }
@@ -63,6 +70,10 @@ private:
 
     Tensor w_router_gate_;  // [num_experts, hidden] FP16
     std::vector<MLP> experts_;  // num_experts MLPs
+
+    MLP shared_expert_;  // shared expert (Qwen2-MoE)
+    Tensor w_shared_expert_gate_;  // [hidden, 1] FP16 (Qwen2-MoE)
+    bool has_shared_expert_ = false;
 
     // Persistent buffers
     Tensor router_logits_buf_;  // [B, num_experts]

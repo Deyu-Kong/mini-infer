@@ -143,6 +143,12 @@ TransformerModel::TransformerModel(const ModelConfig& cfg, int device_index)
             lw.moe.init(cfg.hidden_size, cfg.moe_intermediate_size,
                        cfg.num_experts, cfg.num_experts_per_tok,
                        device_index, cfg.mlp_act);
+            // Qwen2-MoE: initialize shared expert
+            if (cfg.shared_expert_intermediate_size > 0) {
+                lw.moe.init_shared_expert(cfg.hidden_size,
+                                          cfg.shared_expert_intermediate_size,
+                                          device_index, cfg.mlp_act);
+            }
         } else {
             lw.use_moe = false;
             lw.mlp.init(cfg.hidden_size, cfg.intermediate_size, device_index,
@@ -261,6 +267,26 @@ void TransformerModel::load_weights(const WeightIndex& idx) {
                 Tensor wu = WeightNameMapper::load_weight_as_f16(idx, w3_name, device_index_);
                 Tensor wd = WeightNameMapper::load_weight_as_f16(idx, w2_name, device_index_);
                 layers_[i].moe.set_expert_weights(e, wg, wu, wd);
+            }
+
+            // Qwen2-MoE: load shared expert weights
+            std::string shared_prefix = moe_prefix_deepseek + "shared_expert.";
+            if (idx.find(shared_prefix + "gate_proj.weight") != nullptr) {
+                Tensor swg = WeightNameMapper::load_weight_as_f16(
+                    idx, shared_prefix + "gate_proj.weight", device_index_);
+                Tensor swu = WeightNameMapper::load_weight_as_f16(
+                    idx, shared_prefix + "up_proj.weight", device_index_);
+                Tensor swd = WeightNameMapper::load_weight_as_f16(
+                    idx, shared_prefix + "down_proj.weight", device_index_);
+                layers_[i].moe.set_shared_expert_weights(swg, swu, swd);
+
+                // Load shared expert gate
+                std::string shared_gate_name = moe_prefix_deepseek + "shared_expert_gate.weight";
+                if (idx.find(shared_gate_name) != nullptr) {
+                    Tensor sgate = WeightNameMapper::load_weight_as_f16(
+                        idx, shared_gate_name, device_index_);
+                    layers_[i].moe.set_shared_expert_gate(sgate);
+                }
             }
         } else {
             // Dense MLP: same shape for both archs, but we go through the

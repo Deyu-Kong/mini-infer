@@ -95,6 +95,9 @@ MoELayer::MoELayer(MoELayer&& other) noexcept {
     act_ = other.act_;
     w_router_gate_ = std::move(other.w_router_gate_);
     experts_ = std::move(other.experts_);
+    shared_expert_ = std::move(other.shared_expert_);
+    w_shared_expert_gate_ = std::move(other.w_shared_expert_gate_);
+    has_shared_expert_ = other.has_shared_expert_;
     router_logits_buf_ = std::move(other.router_logits_buf_);
     expert_weights_buf_ = std::move(other.expert_weights_buf_);
     expert_indices_buf_ = std::move(other.expert_indices_buf_);
@@ -113,6 +116,9 @@ MoELayer& MoELayer::operator=(MoELayer&& other) noexcept {
         act_ = other.act_;
         w_router_gate_ = std::move(other.w_router_gate_);
         experts_ = std::move(other.experts_);
+        shared_expert_ = std::move(other.shared_expert_);
+        w_shared_expert_gate_ = std::move(other.w_shared_expert_gate_);
+        has_shared_expert_ = other.has_shared_expert_;
         router_logits_buf_ = std::move(other.router_logits_buf_);
         expert_weights_buf_ = std::move(other.expert_weights_buf_);
         expert_indices_buf_ = std::move(other.expert_indices_buf_);
@@ -145,6 +151,12 @@ void MoELayer::init(int64_t hidden, int64_t moe_intermediate, int64_t num_expert
     }
 }
 
+void MoELayer::init_shared_expert(int64_t hidden, int64_t shared_intermediate,
+                                   int device_index, ActKind act) {
+    shared_expert_.init(hidden, shared_intermediate, device_index, act);
+    has_shared_expert_ = true;
+}
+
 void MoELayer::set_router_gate(const Tensor& w_gate) {
     if (w_gate.shape() != std::vector<int64_t>{num_experts_, hidden_}) {
         throw std::runtime_error("MoELayer: router gate shape mismatch");
@@ -158,6 +170,16 @@ void MoELayer::set_expert_weights(int64_t expert_idx, const Tensor& w_gate,
         throw std::runtime_error("MoELayer: expert index out of range");
     }
     experts_[expert_idx].set_weights(w_gate, w_up, w_down);
+}
+
+void MoELayer::set_shared_expert_weights(const Tensor& w_gate, const Tensor& w_up,
+                                          const Tensor& w_down) {
+    shared_expert_.set_weights(w_gate, w_up, w_down);
+    has_shared_expert_ = true;
+}
+
+void MoELayer::set_shared_expert_gate(const Tensor& w_gate) {
+    w_shared_expert_gate_ = w_gate.to(Device::cuda(device_index_));
 }
 
 Tensor MoELayer::forward(const Tensor& x) {
@@ -245,6 +267,29 @@ Tensor MoELayer::forward(const Tensor& x) {
                 static_cast<const int*>(expert_indices_buf_.data()),
                 k, e, B, static_cast<int>(hidden_), K, /*stream=*/0);
         }
+    }
+
+    // 4. Add shared expert output (Qwen2-MoE)
+    // output += sigmoid(gate(x)) * shared_expert(x)
+    if (has_shared_expert_) {
+        Tensor shared_out = shared_expert_.forward(x);
+
+        // Compute gate: gate_logits = x @ w_shared_expert_gate^T -> [B, 1]
+        Tensor gate_logits = Tensor::empty({B, 1}, DType::FP16,
+                                            Device::cuda(device_index_));
+        gemm_rowmajor_f16(handle,
+            B, 1, static_cast<int>(hidden_),
+            static_cast<const __half*>(x.data()), static_cast<int>(hidden_),
+            static_cast<const __half*>(w_shared_expert_gate_.data()), static_cast<int>(hidden_),
+            static_cast<__half*>(gate_logits.data()), 1,
+            one, zero);
+
+        // Apply sigmoid and multiply: output += sigmoid(gate_logits) * shared_out
+        kernels::launch_moe_shared_expert_add(
+            static_cast<__half*>(output.data()),
+            static_cast<const __half*>(shared_out.data()),
+            static_cast<const __half*>(gate_logits.data()),
+            B, static_cast<int>(hidden_), /*stream=*/0);
     }
 
     return output;

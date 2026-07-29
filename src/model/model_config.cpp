@@ -108,6 +108,8 @@ ModelConfig ModelConfig::load(const std::string& path) {
     if (c.num_experts > 0 && c.moe_intermediate_size == 0) {
         c.moe_intermediate_size = c.intermediate_size;
     }
+    // Qwen2-MoE shared expert intermediate size
+    c.shared_expert_intermediate_size = jget_int(j, "shared_expert_intermediate_size", 0);
 
     // ---- arch-specific overrides --------------------------------------
     c.arch = arch_from_model_type(c.model_type);

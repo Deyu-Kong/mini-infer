@@ -60,5 +60,25 @@ void launch_moe_scatter_add(__half* output,
                             int top_k,
                             cudaStream_t stream);
 
+/**
+ * Shared expert addition (Qwen2-MoE).
+ *
+ * For each token b:
+ *   output[b, :] += sigmoid(gate_logits[b]) * shared_output[b, :]
+ *
+ * @param output         [B, hidden] FP16 — accumulated output (modified in-place)
+ * @param shared_output  [B, hidden] FP16 — shared expert's output
+ * @param gate_logits    [B, 1] FP16 — gate logits (before sigmoid)
+ * @param batch_size     B
+ * @param hidden         H
+ * @param stream         CUDA stream
+ */
+void launch_moe_shared_expert_add(__half* output,
+                                   const __half* shared_output,
+                                   const __half* gate_logits,
+                                   int batch_size,
+                                   int hidden,
+                                   cudaStream_t stream);
+
 }  // namespace kernels
 }  // namespace mini_infer

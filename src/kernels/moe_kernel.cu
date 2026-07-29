@@ -123,5 +123,40 @@ void launch_moe_scatter_add(__half* output,
         expert_k, current_expert, batch_size, hidden, top_k);
 }
 
+__global__ void moe_shared_expert_add_kernel(__half* __restrict__ output,
+                                              const __half* __restrict__ shared_output,
+                                              const __half* __restrict__ gate_logits,
+                                              int batch_size,
+                                              int hidden) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch_size * hidden;
+    if (idx >= total) return;
+
+    int b = idx / hidden;
+
+    // Compute sigmoid(gate_logits[b])
+    float gate_val = __half2float(gate_logits[b]);
+    float gate_sigmoid = 1.0f / (1.0f + expf(-gate_val));
+
+    // output[b, h] += sigmoid(gate) * shared_output[b, h]
+    float out_val = __half2float(output[idx]);
+    float shared_val = __half2float(shared_output[idx]);
+    out_val += gate_sigmoid * shared_val;
+    output[idx] = __float2half(out_val);
+}
+
+void launch_moe_shared_expert_add(__half* output,
+                                   const __half* shared_output,
+                                   const __half* gate_logits,
+                                   int batch_size,
+                                   int hidden,
+                                   cudaStream_t stream) {
+    int total = batch_size * hidden;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    moe_shared_expert_add_kernel<<<blocks, threads, 0, stream>>>(
+        output, shared_output, gate_logits, batch_size, hidden);
+}
+
 }  // namespace kernels
 }  // namespace mini_infer

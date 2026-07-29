@@ -98,6 +98,7 @@ struct ModelConfig {
     int64_t   num_experts         = 0;          // 0 = dense MLP
     int64_t   num_experts_per_tok = 0;          // top-K experts per token
     int64_t   moe_intermediate_size = 0;        // per-expert intermediate size
+    int64_t   shared_expert_intermediate_size = 0;  // Qwen2-MoE shared expert
 
     // -------- derived --------
     int64_t head_dim() const {
