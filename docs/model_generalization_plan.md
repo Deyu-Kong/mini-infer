@@ -146,27 +146,40 @@ enum class ModelArch {
 
 ## Phase 4: MoE Support (DONE)
 
-Mixtral / DeepSeek-MoE / Qwen2-MoE support implemented.
+Mixtral / DeepSeek-MoE / Qwen2-MoE support implemented and verified.
 
 ### What's done
 
 - `ModelConfig` extended with MoE fields: `num_experts`, `num_experts_per_tok`,
-  `moe_intermediate_size`. Parses both `num_experts` (Qwen2-MoE) and
-  `num_local_experts` (Mixtral) from config.json. `is_moe()` helper returns
+  `moe_intermediate_size`, `shared_expert_intermediate_size`. Parses both
+  `num_experts` (Qwen2-MoE), `num_local_experts` (Mixtral), and
+  `n_routed_experts` (DeepSeek) from config.json. `is_moe()` helper returns
   true when MoE is enabled.
 - `MoELayer` class (`src/layers/moe.h/cpp`): owns N expert MLPs + router gate.
   Forward: router GEMM → fused top-K + softmax CUDA kernel → per-expert MLP
   → weighted scatter-add accumulation.
+- Qwen2-MoE shared expert support: `output += sigmoid(gate(x)) * shared_expert(x)`
+  with fused CUDA kernel for sigmoid + multiply-add.
 - `moe_kernel.cu`: fused top-K expert selection with softmax weighting,
-  plus scatter-add kernel for accumulating expert outputs.
+  scatter-add kernel for accumulating expert outputs, and shared expert
+  addition kernel.
 - `TransformerModel` dispatches to `MoELayer` or `MLP` per-layer based on
   `LayerWeights::use_moe` flag. Weight loading reads Mixtral-style
-  `block_sparse_moe.gate.weight` + `block_sparse_moe.experts.{j}.w{1,2,3}.weight`.
+  `block_sparse_moe.gate.weight` + `block_sparse_moe.experts.{j}.w{1,2,3}.weight`
+  and Qwen2-MoE style `mlp.gate.weight` + `mlp.experts.{j}.{gate,up,down}_proj.weight`
+  + `mlp.shared_expert.{gate,up,down}_proj.weight` + `mlp.shared_expert_gate.weight`.
+
+### End-to-end verification
+
+Tested with **Qwen1.5-MoE-A2.7B-Chat** (60 experts, top-4, shared expert):
+- Model loads successfully (~16GB weights)
+- Inference generates coherent text at ~37 tok/s
+- Output: "Hello! I'm an AI language model. How can I help you?..."
 
 ### New files
 
 - `src/layers/moe.h/cpp` — MoE layer implementation
-- `src/kernels/moe_kernel.cu` — fused top-K gate + expert dispatch kernel
+- `src/kernels/moe_kernel.cu` — fused top-K gate + expert dispatch + shared expert kernels
 - `src/kernels/moe_kernel.cuh` — kernel declarations
 
 ### Files modified
