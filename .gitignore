@@ -43,9 +43,15 @@ nsys-*
 # Logs
 *.log
 
-# Python (for tests / benchmarks)
+# Python (for tests / benchmarks / SDK)
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
+*.egg
+.eggs/
+build/
+dist/
 .ipynb_checkpoints/
 
 # Local model / data caches

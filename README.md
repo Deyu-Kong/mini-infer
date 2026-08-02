@@ -32,38 +32,103 @@ cmake --build build -j
 cd build && ctest --output-on-failure
 ```
 
-## Usage
+## Quick Start
 
-### Naive autoregressive
+### 1. Build & Test (30 sec)
 
 ```bash
-./build/mini_infer \
-    --model /path/to/Qwen2.5-7B-Instruct \
-    --prompt "Hello, how are you?" \
-    --max-new-tokens 100 \
-    --greedy
+scripts/build.sh          # CMake + Ninja Release build
+scripts/run_tests.sh      # 15+ unit tests, all kernel + layer + model
 ```
 
-### PagedAttention
+### 2. CLI — One-liner inference
 
 ```bash
-./build/mini_infer \
-    --model /path/to/Qwen2.5-7B-Instruct \
-    --prompt "Write a Python function" \
-    --max-new-tokens 100 \
-    --greedy --paged
-```
+# Naive autoregressive
+./build/mini_infer --model /path/to/Qwen2.5-7B-Instruct \
+    --prompt "Explain quantum computing" --max-new-tokens 100 --greedy
 
-### Speculative decoding
+# PagedAttention (4x more concurrent sequences, 95% memory utilization)
+./build/mini_infer --model /path/to/Qwen2.5-7B-Instruct \
+    --prompt "Write a Python function" --max-new-tokens 100 --greedy --paged
 
-```bash
-./build/mini_infer \
-    --model /path/to/Qwen2.5-7B-Instruct \
+# Speculative Decoding (2-3x speedup, 88-93% accept rate)
+./build/mini_infer --model /path/to/Qwen2.5-7B-Instruct \
     --spec-draft /path/to/Qwen2.5-Coder-1.5B-Instruct \
-    --prompt "Explain transformers" \
-    --max-new-tokens 100 \
-    --greedy --gamma 4
+    --prompt "Explain transformers" --max-new-tokens 100 --greedy --gamma 4
 ```
+
+### 3. Python SDK — 3 lines to production
+
+```bash
+pip install -e sdk/   # install mini-infer-sdk
+```
+
+```python
+from mini_infer_sdk import MiniInfer
+
+# Initialize with model (auto-detects binary, tokenizer, GPU)
+engine = MiniInfer(
+    model_path="/path/to/Qwen2.5-7B-Instruct",
+    draft_path="/path/to/Qwen2.5-Coder-1.5B-Instruct",  # optional
+)
+
+# Single generation
+result = engine.generate("Explain the transformer architecture.")
+print(f"Response: {result.text}")
+print(f"Speed: {result.tokens_per_sec:.1f} tok/s")
+
+# Multi-turn chat with history
+chat = engine.chat(system_prompt="You are a concise AI assistant.")
+chat.send("What is the capital of France?")
+chat.send("What is its population?")          # remembers context
+for msg in chat.history:
+    print(f"[{msg.role}]: {msg.content}")
+
+# Batch processing (10 prompts, 1 line)
+batch = engine.batch()
+stats = batch.process(["Summarize Python.", "Sort a list.", "Explain GIL."])
+print(f"Throughput: {stats.tokens_per_sec:.1f} tok/s")
+
+# Benchmark comparison
+python sdk/examples/04_benchmark.py \
+    --model /path/to/Qwen2.5-7B-Instruct \
+    --draft /path/to/Qwen2.5-Coder-1.5B-Instruct
+```
+
+### 4. Run benchmarks
+
+```bash
+# Kernel microbenchmarks
+./build/benchmarks/bench_kernels
+
+# Static batching benchmark
+./build/benchmarks/bench_static \
+    --model /path/to/Qwen2.5-7B-Instruct \
+    --dataset benchmarks/datasets/sharegpt_sample.json
+
+# Continuous batching benchmark (2.14x throughput)
+./build/benchmarks/bench_continuous \
+    --model /path/to/Qwen2.5-7B-Instruct \
+    --dataset benchmarks/datasets/sharegpt_sample.json
+```
+
+## CLI Reference
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--model DIR` | string | *required* | HuggingFace model directory |
+| `--prompt TEXT` | string | `"你好，请介绍一下你自己。"` | Input prompt |
+| `--max-new-tokens N` | int | `100` | Max tokens to generate |
+| `--max-seq-len M` | int | `2048` | Max sequence length |
+| `--device D` | int | `0` | GPU device index |
+| `--greedy` | flag | — | Greedy sampling (default: top-p) |
+| `--temperature T` | float | `1.0` | Sampling temperature |
+| `--top-p P` | float | `0.9` | Nucleus sampling probability |
+| `--paged` | flag | — | Enable PagedAttention |
+| `--seed S` | int | `42` | Random seed |
+| `--spec-draft DIR` | string | — | Draft model for speculative decoding |
+| `--gamma G` | int | `4` | Speculative decoding gamma |
 
 ## Key Features
 
@@ -150,6 +215,10 @@ mini-infer/
 │   ├── bench_static.cpp   # Static batching benchmark
 │   └── bench_continuous.cpp # Continuous batching benchmark
 ├── tests/                 # 15 unit tests + integration tests
+├── sdk/                   # Python SDK
+│   ├── mini_infer_sdk/    # Core package (engine, chat, batch)
+│   ├── examples/          # Quick-start, chat, batch, benchmark demos
+│   └── setup.py           # pip install -e sdk/
 ├── docs/
 │   ├── blog.md            # Technical blog (3000+ words)
 │   └── PROJECT_PLAN.md    # Project plan
