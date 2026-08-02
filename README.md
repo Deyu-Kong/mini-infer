@@ -8,8 +8,18 @@
 
 ## Supported Models
 
-- **Target**: Qwen2.5-7B-Instruct / Qwen2.5-Coder-7B-Instruct (FP16)
-- **Draft**: Qwen2.5-Coder-1.5B-Instruct (FP16, for speculative decoding)
+The engine auto-detects architecture from HuggingFace `config.json` and dispatches
+via `ArchRegistry`. Any model sharing the **RMSNorm + RoPE + SwiGLU + GQA** family
+works out of the box:
+
+| Architecture | Models | Status |
+|-------------|--------|--------|
+| QwenLLaMA | Qwen2/2.5, LLaMA 2/3/3.1, Mistral, Yi, DeepSeek, Phi3 | ✅ verified |
+| Gemma | Gemma 1/2/3 (GeGLU, 4-norm block, Q/K RMSNorm, sliding window) | ✅ verified |
+| MoE | Mixtral, DeepSeek-MoE, Qwen2-MoE (with shared expert) | ✅ verified |
+
+**Primary test model**: Qwen2.5-7B-Instruct / Qwen2.5-Coder-7B-Instruct (FP16)
+**Draft model** (speculative decoding): Qwen2.5-Coder-1.5B-Instruct (FP16)
 
 ## Hardware
 
