@@ -119,26 +119,6 @@ Run all experiments: `python benchmarks/ablation/run_all.py --model <target> --d
 | Softmax | N=57344, D=512 | 176.13 | 191.49 |
 | SwiGLU | N=2048, I=18944 | 348.16 | 349.18 |
 
-## Tests (15/15 pass)
-
-| Test | Validates against |
-| ---- | ----------------- |
-| tensor | shape / h2d / d2h / add kernel |
-| allocator | 256-byte alignment / monotonic / overflow / reset |
-| rmsnorm | torch.rsqrt(x.pow(2).mean(...) + eps)*w |
-| rope | math formula (split last-dim + rotate) |
-| softmax | torch.softmax(dim=-1) |
-| swiglu | silu(gate) * up |
-| mlp | full SwiGLU MLP via cuBLAS GEMM |
-| model_config | valid / missing fields / GQA / missing required |
-| graph | empty / single node / Qwen single block / print |
-| safetensors | 339 tensor index / shape check / BF16 round-trip |
-| qwen_model | load 14GB Qwen2.5-7B-Instruct, FP16 to GPU |
-| paged_attention | prefill / decode consistency (FP16) |
-| request | state machine / metrics / stop tokens |
-| prefix_cache | Radix Trie / LRU / CoW / block hash |
-| spec_correctness | greedy output matches naive autoregressive |
-
 ## Project Structure
 
 ```
