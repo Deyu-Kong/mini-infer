@@ -200,10 +200,20 @@ mi_force_cuda(mini_infer_speculative
 )
 
 # -----------------------------------------------------------------------------
-# mini_infer executable: CLI entry point
+# mini_infer executable: CLI entry point (offline generate / serve / client)
 # -----------------------------------------------------------------------------
-add_executable(mini_infer src/core/main.cc)
-target_link_libraries(mini_infer PRIVATE mini_infer_engine mini_infer_speculative)
+find_package(Threads REQUIRED)
+add_executable(mini_infer
+    src/core/main.cc
+    src/core/server.cc
+    src/core/http_server.cc
+    src/core/http_client.cc
+)
+target_link_libraries(mini_infer PRIVATE
+    mini_infer_engine
+    mini_infer_speculative
+    Threads::Threads
+)
 set_source_files_properties(src/core/main.cc PROPERTIES LANGUAGE CUDA)
 
 # -----------------------------------------------------------------------------

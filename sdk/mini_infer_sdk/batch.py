@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Iterator
 
 from .config import InferenceConfig
-from .engine import GenerationResult
+from .result import GenerationResult
 
 
 @dataclass

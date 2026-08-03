@@ -2,13 +2,14 @@ from setuptools import setup, find_packages
 
 setup(
     name="mini-infer-sdk",
-    version="0.1.0",
-    description="Python SDK for mini-infer — a lightweight C++/CUDA LLM inference engine",
+    version="0.2.0",
+    description="Python SDK for mini-infer — a lightweight C++/CUDA LLM inference engine (offline + online)",
     author="mini-infer team",
     packages=find_packages(),
     python_requires=">=3.8",
     install_requires=[
         "tokenizers>=0.15.0",
+        "requests>=2.25.0",
     ],
     extras_require={
         "dev": ["pytest", "pytest-benchmark"],
